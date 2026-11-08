@@ -4,7 +4,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QPlainTextEdit, QPushButton, QSplitter, QTableWidget,
+    QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -196,15 +196,19 @@ class SchemaTab(QWidget):
         self.index_dialog: IndexDialog | None = None
         self._connection_key = None
         self._needs_refresh = False
+        self._refresh_error: str | None = None
 
         self.active_label = QLabel("Connect a database to view its indexes.")
         self.active_label.setWordWrap(True)
         self.btn_refresh = QPushButton("Refresh")
         self.btn_create = QPushButton("Create index…")
+        self.btn_delete = QPushButton("Delete index…")
         self.btn_refresh.clicked.connect(self.refresh)
         self.btn_create.clicked.connect(self._new_index)
+        self.btn_delete.clicked.connect(self._delete_index)
         buttons = QHBoxLayout()
         buttons.addWidget(self.btn_create)
+        buttons.addWidget(self.btn_delete)
         buttons.addWidget(self.btn_refresh)
         buttons.addStretch()
         self.indexes_list = QListWidget()
@@ -243,6 +247,7 @@ class SchemaTab(QWidget):
             self._needs_refresh = active is not None
             self._show_snapshot(SchemaSnapshot((), ()))
             self.message_label.clear()
+            self._refresh_error = None
             if self.index_dialog is not None:
                 self.index_dialog.set_busy(False)
                 self.index_dialog.reject()
@@ -257,6 +262,11 @@ class SchemaTab(QWidget):
         available = active is not None and not busy and not self.controller._closing
         self.btn_refresh.setEnabled(available)
         self.btn_create.setEnabled(available and not active.read_only and bool(self.snapshot.tables))
+        selected = self.selected_index()
+        self.btn_delete.setEnabled(
+            available and not active.read_only and selected is not None and selected.is_user_created
+        )
+        self.btn_delete.setToolTip("Table constraint indexes must be changed through UC-04.")
         self.indexes_list.setEnabled(not busy)
         if self.index_dialog is not None:
             self.index_dialog.set_busy(busy)
@@ -276,23 +286,31 @@ class SchemaTab(QWidget):
         if name == "connect" and success:
             # Reopening the same file can still reveal changes made elsewhere.
             self._needs_refresh = self.controller.active is not None
+        if name == "schema.delete" and not success:
+            # Another application may have changed the schema since our last read.
+            self._needs_refresh = self.controller.active is not None
         if name != "shutdown" and self._needs_refresh:
             self.refresh()
 
     def _operation_result(self, name: str, result):
-        if name not in {"schema.refresh", "schema.create"}:
+        if name not in {"schema.refresh", "schema.create", "schema.delete"}:
             return
         selected_name = None
         if name == "schema.create" and self.index_dialog is not None:
             selected_name = self.index_dialog.get_index().name
         self._show_snapshot(result, selected_name)
-        if name == "schema.create":
-            message = "Index created."
+        if name in {"schema.create", "schema.delete"}:
+            self._refresh_error = None
+            verb = "created" if name == "schema.create" else "deleted"
+            message = f"Index {verb}."
             if result.in_transaction:
-                message = "Index created in the current transaction. Commit it to save the change."
+                message = f"Index {verb} in the current transaction. Commit it to save the change."
             self.message_label.setText(message)
-            if self.index_dialog is not None:
+            if name == "schema.create" and self.index_dialog is not None:
                 self.index_dialog.accept()
+        elif self._refresh_error:
+            self.message_label.setText(self._refresh_error)
+            self._refresh_error = None
         elif result.indexes:
             self.message_label.setText(f"Indexes: {len(result.indexes)}")
         else:
@@ -302,6 +320,10 @@ class SchemaTab(QWidget):
         if not name.startswith("schema."):
             return
         self.message_label.setText(message)
+        if name == "schema.delete":
+            self._refresh_error = message
+        elif name == "schema.refresh":
+            self._refresh_error = None
         if name == "schema.create" and self.index_dialog is not None:
             self.index_dialog.show_error(message)
 
@@ -333,6 +355,7 @@ class SchemaTab(QWidget):
         return next((index for index in self.snapshot.indexes if index.name == name), None)
 
     def _selection_changed(self, *_):
+        self._set_busy(self.controller.busy)
         index = self.selected_index()
         if index is None:
             self.details_edit.clear()
@@ -378,3 +401,20 @@ class SchemaTab(QWidget):
         )
         if not accepted and self.index_dialog is not None:
             self.index_dialog.show_error("Another database operation is running. Try again when it finishes.")
+
+    def _delete_index(self):
+        index = self.selected_index()
+        if index is None or not self.btn_delete.isEnabled():
+            return
+        answer = QMessageBox.question(
+            self, "Delete index?",
+            f'Delete index "{index.name}" from table "{index.table_name}"?\n\n'
+            "The table and its rows will be kept.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.controller.submit_database_operation(
+                "schema.delete",
+                lambda manager: SchemaManager(SQLiteIndexRepository(manager.executor.connection)).delete_index(index.name),
+            )

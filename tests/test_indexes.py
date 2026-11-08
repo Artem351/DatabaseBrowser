@@ -294,3 +294,188 @@ def test_empty_database_has_empty_schema(tmp_path):
         snapshot = SchemaManager(SQLiteIndexRepository(connection)).get_schema()
         assert snapshot.tables == ()
         assert snapshot.indexes == ()
+
+
+@pytest.mark.parametrize("unique", [False, True])
+def test_uc08_deletes_user_index_without_changing_table_or_rows(index_db, unique):
+    path, connection, manager = index_db
+    manager.create_index(definition(unique=unique))
+    table_sql = connection.execute("SELECT sql FROM sqlite_schema WHERE name = 'items'").fetchone()
+    rows = connection.execute("SELECT * FROM items ORDER BY id").fetchall()
+    snapshot = manager.delete_index("ix_items")
+    assert all(index.name != "ix_items" for index in snapshot.indexes)
+    assert not snapshot.in_transaction
+    assert not connection.in_transaction
+    assert stored_sql(connection) is None
+    assert connection.execute("SELECT sql FROM sqlite_schema WHERE name = 'items'").fetchone() == table_sql
+    assert connection.execute("SELECT * FROM items ORDER BY id").fetchall() == rows
+    with closing(sqlite3.connect(path)) as reopened:
+        assert stored_sql(reopened) is None
+        assert reopened.execute("SELECT * FROM items ORDER BY id").fetchall() == rows
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE INDEX ix_special ON items(title) WHERE title IS NOT NULL",
+        "CREATE INDEX ix_special ON items(lower(title))",
+        "CREATE INDEX ix_special ON items(title COLLATE NOCASE)",
+    ],
+)
+def test_uc08_can_delete_special_user_indexes(index_db, sql):
+    _, connection, manager = index_db
+    connection.execute(sql)
+    assert not next(index for index in manager.get_schema().indexes if index.name == "ix_special").can_edit
+    manager.delete_index("ix_special")
+    assert stored_sql(connection, "ix_special") is None
+    assert connection.execute("SELECT count(*) FROM items").fetchone() == (4,)
+
+
+@pytest.mark.parametrize(
+    "table_sql",
+    [
+        "CREATE TABLE protected(name TEXT UNIQUE)",
+        "CREATE TABLE protected(a TEXT, b TEXT, PRIMARY KEY(a, b))",
+        "CREATE TABLE protected(a TEXT, b TEXT, PRIMARY KEY(a, b)) WITHOUT ROWID",
+    ],
+)
+def test_uc08_refuses_to_delete_an_index_owned_by_a_constraint(index_db, table_sql):
+    _, connection, manager = index_db
+    connection.execute(table_sql)
+    index = next(index for index in manager.get_schema().indexes if index.table_name == "protected")
+    before = connection.execute("SELECT name, sql FROM sqlite_schema ORDER BY name").fetchall()
+    with pytest.raises(IndexOperationError, match="UC-04"):
+        manager.delete_index(index.name)
+    assert connection.execute("SELECT name, sql FROM sqlite_schema ORDER BY name").fetchall() == before
+    assert any(item.name == index.name for item in manager.get_schema().indexes)
+    assert not connection.in_transaction
+
+
+def test_uc08_missing_index_reports_error_without_changing_schema(index_db):
+    _, connection, manager = index_db
+    manager.create_index(definition())
+    before = stored_sql(connection)
+    with pytest.raises(IndexOperationError, match="does not exist"):
+        manager.delete_index("missing")
+    assert stored_sql(connection) == before
+    assert not connection.in_transaction
+
+
+def test_uc08_deletes_quoted_name_without_treating_it_as_sql(index_db):
+    _, connection, manager = index_db
+    name = 'Удалить "индекс"; DROP TABLE items; --'
+    manager.create_index(definition(name=name))
+    manager.delete_index(name)
+    assert stored_sql(connection, name) is None
+    assert connection.execute("SELECT count(*) FROM items").fetchone() == (4,)
+
+
+def test_uc08_accepts_ascii_case_in_index_name(index_db):
+    _, connection, manager = index_db
+    manager.create_index(definition())
+    manager.delete_index("IX_ITEMS")
+    assert stored_sql(connection) is None
+
+
+def test_uc08_does_not_delete_same_named_temporary_index(index_db):
+    _, connection, manager = index_db
+    manager.create_index(definition())
+    connection.execute("CREATE TEMP TABLE other_table(value TEXT)")
+    connection.execute("CREATE INDEX temp.ix_items ON other_table(value)")
+    manager.delete_index("ix_items")
+    assert stored_sql(connection) is None
+    assert connection.execute("SELECT name FROM temp.sqlite_schema WHERE type = 'index'").fetchall() == [("ix_items",)]
+
+
+def test_uc08_read_only_error_preserves_index_and_connection(index_db):
+    path, _, manager = index_db
+    manager.create_index(definition())
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as connection:
+        readonly_manager = SchemaManager(SQLiteIndexRepository(connection))
+        before = stored_sql(connection)
+        with pytest.raises(IndexOperationError, match="readonly"):
+            readonly_manager.delete_index("ix_items")
+        assert stored_sql(connection) == before
+        assert not connection.in_transaction
+        assert connection.execute("SELECT count(*) FROM items").fetchone() == (4,)
+
+
+def test_uc08_delete_stays_inside_existing_transaction(index_db):
+    path, connection, manager = index_db
+    manager.create_index(definition())
+    original_sql = stored_sql(connection)
+    connection.execute("UPDATE items SET title = 'pending' WHERE id = 1")
+    snapshot = manager.delete_index("ix_items")
+    assert snapshot.in_transaction
+    assert connection.in_transaction
+    assert stored_sql(connection) is None
+    assert connection.execute("SELECT title FROM items WHERE id = 1").fetchone() == ("pending",)
+    with closing(sqlite3.connect(path)) as observer:
+        assert stored_sql(observer) == original_sql
+        assert observer.execute("SELECT title FROM items WHERE id = 1").fetchone() == ("First",)
+    connection.rollback()
+    assert stored_sql(connection) == original_sql
+    assert connection.execute("SELECT title FROM items WHERE id = 1").fetchone() == ("First",)
+
+
+def test_uc08_failed_schema_refresh_restores_deleted_index(index_db, monkeypatch):
+    _, connection, manager = index_db
+    manager.create_index(definition())
+    before = stored_sql(connection)
+
+    def fail_refresh():
+        raise sqlite3.OperationalError("cannot read updated schema")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(manager, "get_schema", fail_refresh)
+        with pytest.raises(IndexOperationError, match="cannot read updated schema"):
+            manager.delete_index("ix_items")
+    assert stored_sql(connection) == before
+    assert not connection.in_transaction
+    assert manager.delete_index("ix_items").indexes == ()
+
+
+@pytest.mark.parametrize("outer_transaction", [False, True])
+def test_uc08_release_error_restores_index_and_preserves_outer_transaction(index_db, outer_transaction):
+    _, connection, manager = index_db
+    manager.create_index(definition())
+    before = stored_sql(connection)
+    if outer_transaction:
+        connection.execute("UPDATE items SET title = 'pending' WHERE id = 1")
+    reject_release = True
+
+    def authorizer(action, operation, name, database, trigger):
+        nonlocal reject_release
+        if action == sqlite3.SQLITE_SAVEPOINT and operation == "RELEASE" and reject_release:
+            reject_release = False
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(authorizer)
+    try:
+        with pytest.raises(IndexOperationError, match="not authorized"):
+            manager.delete_index("ix_items")
+    finally:
+        connection.set_authorizer(None)
+    assert stored_sql(connection) == before
+    assert connection.in_transaction == outer_transaction
+    expected_title = "pending" if outer_transaction else "First"
+    assert connection.execute("SELECT title FROM items WHERE id = 1").fetchone() == (expected_title,)
+
+
+def test_uc08_sqlite_rejection_keeps_the_index(index_db):
+    _, connection, manager = index_db
+    manager.create_index(definition())
+    before = stored_sql(connection)
+
+    def authorizer(action, operation, name, database, trigger):
+        return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_DROP_INDEX else sqlite3.SQLITE_OK
+
+    connection.set_authorizer(authorizer)
+    try:
+        with pytest.raises(IndexOperationError, match="not authorized"):
+            manager.delete_index("ix_items")
+    finally:
+        connection.set_authorizer(None)
+    assert stored_sql(connection) == before
+    assert not connection.in_transaction

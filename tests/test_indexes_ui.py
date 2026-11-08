@@ -6,7 +6,7 @@ from threading import Event
 
 import pytest
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QDialogButtonBox
+from PyQt6.QtWidgets import QDialogButtonBox, QMessageBox
 
 from database_browser.controller import ConnectionController
 from database_browser.errors import ProfileStorageError
@@ -196,6 +196,8 @@ def test_create_disabled_without_connection_or_tables(qtbot, window, tmp_path):
 
 
 def test_read_only_connection_allows_viewing_only(qtbot, window, index_database):
+    with closing(sqlite3.connect(index_database)) as connection:
+        connection.execute("CREATE INDEX ix_label ON items(label)")
     open_database(qtbot, window, index_database)
 
     def reopen_read_only(manager):
@@ -205,6 +207,8 @@ def test_read_only_connection_allows_viewing_only(qtbot, window, index_database)
     qtbot.waitUntil(lambda: not window.controller.busy, timeout=5000)
     assert window.schema_tab.btn_refresh.isEnabled()
     assert not window.schema_tab.btn_create.isEnabled()
+    assert window.schema_tab.selected_index().name == "ix_label"
+    assert not window.schema_tab.btn_delete.isEnabled()
 
 
 def test_worker_disables_actions_until_operation_finishes(qtbot, window, index_database):
@@ -241,3 +245,66 @@ def test_failed_shutdown_restores_schema_actions(qtbot, window, index_database):
         assert window.schema_tab.btn_create.isEnabled()
     finally:
         assert wait_operation(qtbot, window.controller, "schema.rollback", lambda: window.controller.submit_database_operation("schema.rollback", lambda manager: manager.executor.connection.rollback()))
+
+
+def test_uc08_confirmation_deletes_index_but_keeps_rows(qtbot, window, index_database, monkeypatch):
+    with closing(sqlite3.connect(index_database)) as connection:
+        connection.execute("CREATE UNIQUE INDEX ix_label ON items(label)")
+    open_database(qtbot, window, index_database)
+    tab = window.schema_tab
+
+    def confirm(parent, title, message, buttons, default):
+        assert "ix_label" in message and "items" in message
+        assert "rows will be kept" in message
+        assert default == QMessageBox.StandardButton.No
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", confirm)
+    assert tab.btn_delete.isEnabled()
+    assert wait_operation(qtbot, window.controller, "schema.delete", lambda: qtbot.mouseClick(tab.btn_delete, Qt.MouseButton.LeftButton))
+    assert tab.indexes_list.count() == 0
+    assert not tab.btn_delete.isEnabled()
+    with closing(sqlite3.connect(index_database)) as connection:
+        assert connection.execute("SELECT category, label FROM items ORDER BY id").fetchall() == [("books", "first"), ("books", "second")]
+        assert connection.execute("SELECT name FROM sqlite_schema WHERE type='index'").fetchall() == []
+
+
+def test_uc08_cancel_keeps_index(qtbot, window, index_database, monkeypatch):
+    with closing(sqlite3.connect(index_database)) as connection:
+        connection.execute("CREATE INDEX ix_label ON items(label)")
+    open_database(qtbot, window, index_database)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.No)
+    qtbot.mouseClick(window.schema_tab.btn_delete, Qt.MouseButton.LeftButton)
+    assert not window.controller.busy
+    assert window.schema_tab.selected_index().name == "ix_label"
+    with closing(sqlite3.connect(index_database)) as connection:
+        assert connection.execute("SELECT name FROM sqlite_schema WHERE type='index'").fetchall() == [("ix_label",)]
+
+
+def test_uc08_constraint_index_cannot_be_deleted(qtbot, window, index_database):
+    with closing(sqlite3.connect(index_database)) as connection:
+        connection.execute("CREATE TABLE protected(code TEXT PRIMARY KEY, email TEXT UNIQUE)")
+    open_database(qtbot, window, index_database)
+    tab = window.schema_tab
+    for row in range(tab.indexes_list.count()):
+        tab.indexes_list.setCurrentRow(row)
+        assert not tab.btn_delete.isEnabled()
+        assert "UC-04" in tab.details_edit.toPlainText()
+
+
+def test_uc08_missing_index_refreshes_list_and_keeps_error(qtbot, window, index_database, monkeypatch):
+    with closing(sqlite3.connect(index_database)) as connection:
+        connection.execute("CREATE INDEX ix_label ON items(label)")
+    open_database(qtbot, window, index_database)
+
+    def remove_elsewhere(*args):
+        with closing(sqlite3.connect(index_database)) as connection:
+            connection.execute("DROP INDEX ix_label")
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", remove_elsewhere)
+    assert not wait_operation(qtbot, window.controller, "schema.delete", lambda: qtbot.mouseClick(window.schema_tab.btn_delete, Qt.MouseButton.LeftButton))
+    qtbot.waitUntil(lambda: not window.controller.busy, timeout=5000)
+    assert window.schema_tab.indexes_list.count() == 0
+    assert "does not exist" in window.schema_tab.message_label.text()
+    assert not window.connection_errors

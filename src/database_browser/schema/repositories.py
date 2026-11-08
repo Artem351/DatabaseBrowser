@@ -6,7 +6,7 @@ from typing import ContextManager, Iterator, Protocol
 from uuid import uuid4
 
 from .models import Index, IndexColumn, TableInfo
-from .sql import create_index_sql
+from .sql import create_index_sql, quote_identifier
 
 
 class IIndexRepository(Protocol):
@@ -18,6 +18,8 @@ class IIndexRepository(Protocol):
     def find_all(self) -> tuple[Index, ...]: ...
 
     def save(self, index: Index) -> None: ...
+
+    def delete(self, name: str) -> None: ...
 
     def atomic_change(self) -> ContextManager[None]: ...
 
@@ -80,6 +82,9 @@ class SQLiteIndexRepository:
 
     def save(self, index: Index) -> None:
         self.connection.execute(create_index_sql(index))
+
+    def delete(self, name: str) -> None:
+        self.connection.execute(f"DROP INDEX main.{quote_identifier(name)}")
 
     @contextmanager
     def atomic_change(self) -> Iterator[None]:

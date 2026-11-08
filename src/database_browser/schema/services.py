@@ -63,3 +63,26 @@ class SchemaManager:
                 # Read before RELEASE: if this fails, the change rolls back too.
                 snapshot = self.get_schema()
             return SchemaSnapshot(snapshot.tables, snapshot.indexes, outer_transaction)
+
+    def _user_index(self, name: str) -> Index:
+        index = next((
+            index for index in self.repository.find_all()
+            if _identifier_key(index.name) == _identifier_key(name)
+        ), None)
+        if index is None:
+            raise IndexOperationError(f'Index "{name}" does not exist. Refresh the schema.')
+        if not index.is_user_created:
+            raise IndexOperationError(
+                "This index belongs to a PRIMARY KEY or UNIQUE table constraint. "
+                "Change the table structure instead (UC-04)."
+            )
+        return index
+
+    def delete_index(self, name: str) -> SchemaSnapshot:
+        with _database_errors():
+            outer_transaction = self.repository.in_transaction
+            with self.repository.atomic_change():
+                index = self._user_index(name)
+                self.repository.delete(index.name)
+                snapshot = self.get_schema()
+            return SchemaSnapshot(snapshot.tables, snapshot.indexes, outer_transaction)
