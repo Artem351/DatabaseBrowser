@@ -20,4 +20,12 @@ QT_QPA_PLATFORM=offscreen python -m pytest -q
 
 Дополнительно на Python 3.14.9: установка через `pip install -e .`, `pip check`, запуск `python -m database_browser --help`, создание подключения в главном окне, отрисовка главного окна, штатное закрытие приложения.
 
-Проверка на Windows и сборка PyInstaller не выполнялись.
+## Windows: UC-06
+
+Python 3.14.6, SQLite 3.50.4, PyQt6/Qt 6.12.0, PyQt6-sip 13.13.0, pytest 8.4.2, pytest-qt 4.5.0.
+
+`./.venv314/Scripts/python.exe -m pytest -q` — **78 passed**.
+
+До изменений отдельно прошли 35 тестов подключений. Добавлены 30 проверок SQLite для индексов и 13 проверок интерфейса: создание и отмена, исправление ошибки без потери ввода, составные индексы, UNIQUE, read-only, переключение БД, внешние транзакции, отказ RELEASE и доступность действий после неудачного закрытия.
+
+Установка через `pip install -e . --no-deps`, `pip check` и запуск `python -m database_browser --help` также прошли. Сборка PyInstaller не выполнялась.

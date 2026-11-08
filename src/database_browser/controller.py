@@ -32,6 +32,7 @@ class ConnectionController(QObject):
     connection_changed = pyqtSignal(object)
     busy_changed = pyqtSignal(bool)
     error_occurred = pyqtSignal(str)
+    operation_failed = pyqtSignal(str, str)
     operation_finished = pyqtSignal(str, bool)
     operation_result = pyqtSignal(str, object)
     shutdown_complete = pyqtSignal()
@@ -82,7 +83,9 @@ class ConnectionController(QObject):
             except Exception as exception:
                 logging.getLogger(__name__).exception("Database operation failed")
                 error = f"Unexpected error: {exception}"
-            if manager is not None and name != "shutdown":
+            if manager is not None and name != "shutdown" and not name.startswith("schema."):
+                # Schema operations cannot change profiles. An unrelated settings error
+                # must not hide a successfully saved index from the interface.
                 # For example, the connection may have closed even if deleting the profile failed.
                 try:
                     profiles = manager.list_connections()
@@ -123,10 +126,14 @@ class ConnectionController(QObject):
             self.profiles_changed.emit(self.profiles)
         self.active = completion.active
         self.connection_changed.emit(self.active)
+        success = completion.error is None
+        if completion.operation == "shutdown" and not success:
+            # Restore actions before the UI receives the idle state.
+            self._closing = False
         self.busy = False
         self.busy_changed.emit(False)
-        success = completion.error is None
         if completion.error:
+            self.operation_failed.emit(completion.operation, completion.error)
             self.error_occurred.emit(completion.error)
         else:
             self.operation_result.emit(completion.operation, completion.result)
@@ -136,8 +143,6 @@ class ConnectionController(QObject):
                 self._closed = True
                 self.tasks.shutdown(wait=False)
                 self.shutdown_complete.emit()
-            else:
-                self._closing = False
         elif self._closing:
             self.request_shutdown()
 
