@@ -1,7 +1,20 @@
 """SQL generation for the column-based index editor."""
 
+import re
+
 from .errors import IndexOperationError
 from .models import Index
+
+
+_SQL_TOKENS = re.compile(
+    r'''--[^\r\n]*|/\*.*?\*/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|(?P<collate>\bCOLLATE\b)''',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def has_collation_clause(sql: str) -> bool:
+    # Skip quoted names and comments: an index named "collate" is still ordinary.
+    return any(token.lastgroup == "collate" for token in _SQL_TOKENS.finditer(sql))
 
 
 def quote_identifier(name: str) -> str:

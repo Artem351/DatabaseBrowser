@@ -2,6 +2,7 @@
 
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import replace
 from string import ascii_lowercase, ascii_uppercase
 from typing import Iterator
 
@@ -56,9 +57,9 @@ class SchemaManager:
 
     def create_index(self, index: Index) -> SchemaSnapshot:
         with _database_errors():
-            self._validate(index)
             outer_transaction = self.repository.in_transaction
             with self.repository.atomic_change():
+                self._validate(index)
                 self.repository.save(index)
                 # Read before RELEASE: if this fails, the change rolls back too.
                 snapshot = self.get_schema()
@@ -84,5 +85,26 @@ class SchemaManager:
             with self.repository.atomic_change():
                 index = self._user_index(name)
                 self.repository.delete(index.name)
+                snapshot = self.get_schema()
+            return SchemaSnapshot(snapshot.tables, snapshot.indexes, outer_transaction)
+
+    def alter_index(self, index: Index) -> SchemaSnapshot:
+        with _database_errors():
+            outer_transaction = self.repository.in_transaction
+            with self.repository.atomic_change():
+                previous = self._user_index(index.name)
+                if not previous.can_edit:
+                    raise IndexOperationError(
+                        "This index uses an expression, WHERE or COLLATE that the column form cannot edit. "
+                        "Its original definition has been kept."
+                    )
+                if _identifier_key(previous.table_name) != _identifier_key(index.table_name):
+                    raise IndexOperationError("An existing index must stay on its original table.")
+                changed = replace(index, name=previous.name, table_name=previous.table_name)
+                self._validate(changed)
+                # SQLite has no ALTER INDEX. Keep both statements in the same savepoint
+                # so a failed CREATE restores the exact original definition.
+                self.repository.delete(previous.name)
+                self.repository.save(changed)
                 snapshot = self.get_schema()
             return SchemaSnapshot(snapshot.tables, snapshot.indexes, outer_transaction)

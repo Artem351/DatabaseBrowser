@@ -6,7 +6,7 @@ from typing import ContextManager, Iterator, Protocol
 from uuid import uuid4
 
 from .models import Index, IndexColumn, TableInfo
-from .sql import create_index_sql, quote_identifier
+from .sql import create_index_sql, has_collation_clause, quote_identifier
 
 
 class IIndexRepository(Protocol):
@@ -66,7 +66,9 @@ class SQLiteIndexRepository:
                     (name,),
                 ).fetchone()
                 # Keep special definitions visible, but don't flatten them in a simple form.
-                editable = not partial and all(
+                sql = definition[0] if definition else None
+                # Even COLLATE BINARY may override a column declared NOCASE.
+                editable = not partial and not has_collation_clause(sql or "") and all(
                     cid >= 0 and column is not None and collation == "BINARY"
                     for cid, column, _, collation in keys
                 )
@@ -76,7 +78,7 @@ class SQLiteIndexRepository:
                 )
                 indexes.append(Index(
                     name, table.name, columns, bool(unique), origin,
-                    definition[0] if definition else None, editable,
+                    sql, editable,
                 ))
         return tuple(sorted(indexes, key=lambda index: index.name))
 

@@ -479,3 +479,328 @@ def test_uc08_sqlite_rejection_keeps_the_index(index_db):
         connection.set_authorizer(None)
     assert stored_sql(connection) == before
     assert not connection.in_transaction
+
+
+def test_uc07_changes_columns_order_and_direction_without_changing_data(index_db):
+    _, connection, manager = index_db
+    manager.create_index(definition())
+    rows = connection.execute("SELECT * FROM items ORDER BY id").fetchall()
+    table_sql = connection.execute("SELECT sql FROM sqlite_schema WHERE name = 'items'").fetchone()
+    columns = (IndexColumn("price", True), IndexColumn("category"))
+    snapshot = manager.alter_index(Index("ix_items", "items", columns))
+    updated = next(index for index in snapshot.indexes if index.name == "ix_items")
+    assert updated.columns == columns
+    keys = connection.execute(
+        'SELECT name, "desc" FROM pragma_index_xinfo(?) WHERE "key" = 1 ORDER BY seqno',
+        ("ix_items",),
+    ).fetchall()
+    assert keys == [("price", 1), ("category", 0)]
+    assert connection.execute("SELECT * FROM items ORDER BY id").fetchall() == rows
+    assert connection.execute("SELECT sql FROM sqlite_schema WHERE name = 'items'").fetchone() == table_sql
+    assert not connection.in_transaction
+    assert not snapshot.in_transaction
+
+
+@pytest.mark.parametrize("unique", [False, True])
+def test_uc07_changes_uniqueness_and_its_actual_behavior(index_db, unique):
+    _, connection, manager = index_db
+    manager.create_index(definition(unique=not unique))
+    snapshot = manager.alter_index(definition(unique=unique))
+    updated = next(index for index in snapshot.indexes if index.name == "ix_items")
+    assert updated.unique == unique
+    assert updated.is_user_created and updated.can_edit
+    if unique:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("INSERT INTO items(title) VALUES ('First')")
+    else:
+        connection.execute("INSERT INTO items(title) VALUES ('First')")
+        assert connection.execute("SELECT count(*) FROM items WHERE title = 'First'").fetchone() == (2,)
+    connection.rollback()
+
+
+def test_uc07_duplicate_unique_failure_restores_exact_old_definition(index_db):
+    _, connection, manager = index_db
+    # Use an existing definition with its own quoting and spacing, not the editor's formatting.
+    connection.execute('CREATE INDEX "ix_items" ON "items" ( "title" DESC )')
+    before_sql = stored_sql(connection)
+    before_indexes = manager.get_schema().indexes
+    rows = connection.execute("SELECT * FROM items ORDER BY id").fetchall()
+    with pytest.raises(IndexOperationError, match="UNIQUE"):
+        manager.alter_index(definition(("category",), unique=True))
+    assert stored_sql(connection) == before_sql
+    assert manager.get_schema().indexes == before_indexes
+    assert connection.execute("SELECT * FROM items ORDER BY id").fetchall() == rows
+    assert not connection.in_transaction
+    # A later valid change still works after the rollback.
+    assert manager.alter_index(definition(("price",))).indexes[0].columns == (IndexColumn("price"),)
+
+
+def test_uc07_create_rejection_after_drop_restores_original_unique_behavior(index_db):
+    _, connection, manager = index_db
+    manager.create_index(definition(unique=True))
+    before_sql = stored_sql(connection)
+    before_indexes = manager.get_schema().indexes
+    actions = []
+
+    def authorizer(action, operation, name, database, trigger):
+        if action == sqlite3.SQLITE_DROP_INDEX:
+            actions.append("drop")
+        if action == sqlite3.SQLITE_CREATE_INDEX:
+            actions.append("create")
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(authorizer)
+    try:
+        with pytest.raises(IndexOperationError, match="not authorized"):
+            manager.alter_index(definition(("price",)))
+    finally:
+        connection.set_authorizer(None)
+    assert actions == ["drop", "create"]
+    assert stored_sql(connection) == before_sql
+    assert manager.get_schema().indexes == before_indexes
+    assert not connection.in_transaction
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute("INSERT INTO items(title) VALUES ('First')")
+    connection.rollback()
+
+
+@pytest.mark.parametrize(
+    "table_sql",
+    [
+        "CREATE TABLE protected(name TEXT UNIQUE)",
+        "CREATE TABLE protected(a TEXT, b TEXT, PRIMARY KEY(a, b))",
+        "CREATE TABLE protected(a TEXT, b TEXT, PRIMARY KEY(a, b)) WITHOUT ROWID",
+    ],
+)
+def test_uc07_refuses_to_change_constraint_owned_indexes(index_db, table_sql):
+    _, connection, manager = index_db
+    connection.execute(table_sql)
+    previous = next(index for index in manager.get_schema().indexes if index.table_name == "protected")
+    before = connection.execute("SELECT name, sql FROM sqlite_schema ORDER BY name").fetchall()
+    # Default origin='c' in the submitted model must not bypass the real metadata.
+    changed = Index(previous.name, previous.table_name, previous.columns, unique=False)
+    with pytest.raises(IndexOperationError, match="UC-04"):
+        manager.alter_index(changed)
+    assert connection.execute("SELECT name, sql FROM sqlite_schema ORDER BY name").fetchall() == before
+    assert next(index for index in manager.get_schema().indexes if index.name == previous.name) == previous
+    assert not connection.in_transaction
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE INDEX ix_items ON items(title) WHERE title IS NOT NULL",
+        "CREATE INDEX ix_items ON items(lower(title))",
+        "CREATE INDEX ix_items ON items(title COLLATE NOCASE)",
+    ],
+)
+def test_uc07_refuses_to_simplify_special_index_definitions(index_db, sql):
+    _, connection, manager = index_db
+    connection.execute(sql)
+    before = manager.get_schema().indexes
+    with pytest.raises(IndexOperationError, match="column form"):
+        manager.alter_index(definition(("price",)))
+    assert stored_sql(connection) == sql
+    assert manager.get_schema().indexes == before
+    assert not connection.in_transaction
+
+
+@pytest.mark.parametrize(
+    "changed, message",
+    [
+        (definition(name="missing"), "does not exist"),
+        (definition(table="another_table"), "original table"),
+        (definition(("missing_column",)), "Column"),
+        (definition(()), "at least one column"),
+        (definition(("title", "TITLE")), "more than once"),
+    ],
+)
+def test_uc07_invalid_change_keeps_previous_index(index_db, changed, message):
+    _, connection, manager = index_db
+    manager.create_index(definition())
+    before = manager.get_schema().indexes
+    with pytest.raises(IndexOperationError, match=message):
+        manager.alter_index(changed)
+    assert manager.get_schema().indexes == before
+    assert not connection.in_transaction
+
+
+def test_uc07_preserves_original_name_when_submitted_with_different_ascii_case(index_db):
+    _, connection, manager = index_db
+    manager.create_index(definition(name="Ix_Items"))
+    snapshot = manager.alter_index(definition(("price",), name="IX_ITEMS", table="ITEMS"))
+    updated = next(index for index in snapshot.indexes if index.name == "Ix_Items")
+    assert updated.table_name == "items"
+    assert updated.columns == (IndexColumn("price"),)
+    assert stored_sql(connection, "IX_ITEMS") is None
+    assert stored_sql(connection, "Ix_Items") is not None
+
+
+def test_uc07_can_change_an_index_with_quotes_in_its_name(index_db):
+    _, connection, manager = index_db
+    name = 'Индекс "каталог"'
+    manager.create_index(definition(name=name))
+    snapshot = manager.alter_index(definition(("price",), name=name))
+    updated = next(index for index in snapshot.indexes if index.name == name)
+    assert updated.columns == (IndexColumn("price"),)
+    assert connection.execute("SELECT count(*) FROM items").fetchone() == (4,)
+
+
+def test_uc07_new_definition_persists_after_reopening(index_db):
+    path, _, manager = index_db
+    manager.create_index(definition(("price",)))
+    columns = (IndexColumn("title", True),)
+    manager.alter_index(Index("ix_items", "items", columns, unique=True))
+    with closing(sqlite3.connect(path)) as reopened:
+        index = SchemaManager(SQLiteIndexRepository(reopened)).get_schema().indexes[0]
+        assert index.columns == columns
+        assert index.unique
+        with pytest.raises(sqlite3.IntegrityError):
+            reopened.execute("INSERT INTO items(title) VALUES ('First')")
+
+
+@pytest.mark.parametrize("unique_failure", [False, True])
+def test_uc07_keeps_unrelated_outer_transaction_changes(index_db, unique_failure):
+    path, connection, manager = index_db
+    manager.create_index(definition())
+    before_sql = stored_sql(connection)
+    before_indexes = manager.get_schema().indexes
+    connection.execute("UPDATE items SET title = 'pending' WHERE id = 1")
+    if unique_failure:
+        with pytest.raises(IndexOperationError, match="UNIQUE"):
+            manager.alter_index(definition(("category",), unique=True))
+        assert stored_sql(connection) == before_sql
+    else:
+        snapshot = manager.alter_index(definition(("price",)))
+        assert snapshot.in_transaction
+        assert stored_sql(connection) != before_sql
+    assert connection.in_transaction
+    assert connection.execute("SELECT title FROM items WHERE id = 1").fetchone() == ("pending",)
+    with closing(sqlite3.connect(path)) as observer:
+        assert stored_sql(observer) == before_sql
+        assert observer.execute("SELECT title FROM items WHERE id = 1").fetchone() == ("First",)
+    connection.rollback()
+    assert manager.get_schema().indexes == before_indexes
+    assert connection.execute("SELECT title FROM items WHERE id = 1").fetchone() == ("First",)
+
+
+def test_uc07_read_only_failure_keeps_original_index(index_db):
+    path, _, manager = index_db
+    manager.create_index(definition())
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as connection:
+        readonly_manager = SchemaManager(SQLiteIndexRepository(connection))
+        before = readonly_manager.get_schema().indexes
+        with pytest.raises(IndexOperationError, match="readonly"):
+            readonly_manager.alter_index(definition(("price",)))
+        assert readonly_manager.get_schema().indexes == before
+        assert not connection.in_transaction
+        assert connection.execute("SELECT count(*) FROM items").fetchone() == (4,)
+
+
+def test_uc07_failed_schema_refresh_restores_original_definition(index_db, monkeypatch):
+    _, connection, manager = index_db
+    manager.create_index(definition())
+    before = manager.get_schema().indexes
+
+    def fail_refresh():
+        raise sqlite3.OperationalError("cannot read updated schema")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(manager, "get_schema", fail_refresh)
+        with pytest.raises(IndexOperationError, match="cannot read updated schema"):
+            manager.alter_index(definition(("price",)))
+    assert manager.get_schema().indexes == before
+    assert not connection.in_transaction
+    assert manager.alter_index(definition(("price",))).indexes[0].columns == (IndexColumn("price"),)
+
+
+def test_uc07_locked_database_keeps_original_index_and_can_be_retried(index_db):
+    path, connection, manager = index_db
+    manager.create_index(definition())
+    before = manager.get_schema().indexes
+    connection.execute("PRAGMA busy_timeout=1")
+    with closing(sqlite3.connect(path)) as other_connection:
+        other_connection.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(IndexOperationError, match="locked"):
+                manager.alter_index(definition(("price",)))
+            assert manager.get_schema().indexes == before
+            assert not connection.in_transaction
+        finally:
+            other_connection.rollback()
+    assert manager.alter_index(definition(("price",))).indexes[0].columns == (IndexColumn("price"),)
+
+
+def test_uc07_explicit_binary_collation_must_not_inherit_nocase(index_db):
+    _, connection, manager = index_db
+    connection.execute("CREATE TABLE names(value TEXT COLLATE NOCASE)")
+    connection.executemany("INSERT INTO names(value) VALUES (?)", [("A",), ("a",)])
+    connection.commit()
+    connection.execute("CREATE UNIQUE INDEX ix_names ON names(value COLLATE BINARY)")
+    before = stored_sql(connection, "ix_names")
+    index = next(index for index in manager.get_schema().indexes if index.name == "ix_names")
+    assert not index.can_edit
+    with pytest.raises(IndexOperationError, match="COLLATE"):
+        manager.alter_index(definition(("value",), name="ix_names", table="names", unique=True))
+    assert stored_sql(connection, "ix_names") == before
+    assert connection.execute("SELECT value FROM names ORDER BY value COLLATE BINARY").fetchall() == [("A",), ("a",)]
+
+
+def test_uc07_collation_word_in_identifiers_and_comments_is_not_a_clause(index_db):
+    _, connection, manager = index_db
+    connection.execute('CREATE TABLE "collate_table"("COLLATE" TEXT, other TEXT)')
+    connection.execute('CREATE INDEX "collate" ON "collate_table"("COLLATE") /* COLLATE NOCASE */')
+    index = next(index for index in manager.get_schema().indexes if index.name == "collate")
+    assert index.can_edit
+    snapshot = manager.alter_index(definition(("other",), name="collate", table="collate_table"))
+    changed = next(index for index in snapshot.indexes if index.name == "collate")
+    assert changed.columns == (IndexColumn("other"),)
+
+
+def test_uc06_schema_change_between_validation_and_create_cannot_change_the_key(index_db, monkeypatch):
+    path, connection, manager = index_db
+    validate = manager._validate
+
+    def validate_while_another_app_renames_column(index):
+        validate(index)
+        with closing(sqlite3.connect(path, timeout=0.01)) as other, other:
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("ALTER TABLE items RENAME COLUMN title TO renamed")
+            other.commit()
+
+    monkeypatch.setattr(manager, "_validate", validate_while_another_app_renames_column)
+    with pytest.raises(IndexOperationError, match="locked"):
+        manager.create_index(definition())
+    assert stored_sql(connection) is None
+    assert not connection.in_transaction
+    assert connection.execute("SELECT title FROM items WHERE id=1").fetchone() == ("First",)
+
+
+@pytest.mark.parametrize("outer_transaction", [False, True])
+def test_uc07_release_failure_restores_definition_and_outer_changes(index_db, outer_transaction):
+    _, connection, manager = index_db
+    manager.create_index(definition())
+    before = manager.get_schema().indexes
+    if outer_transaction:
+        connection.execute("UPDATE items SET title = 'pending' WHERE id = 1")
+    reject_release = True
+
+    def authorizer(action, operation, name, database, trigger):
+        nonlocal reject_release
+        if action == sqlite3.SQLITE_SAVEPOINT and operation == "RELEASE" and reject_release:
+            reject_release = False
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(authorizer)
+    try:
+        with pytest.raises(IndexOperationError, match="not authorized"):
+            manager.alter_index(definition(("price",)))
+    finally:
+        connection.set_authorizer(None)
+    assert manager.get_schema().indexes == before
+    assert connection.in_transaction == outer_transaction
+    expected_title = "pending" if outer_transaction else "First"
+    assert connection.execute("SELECT title FROM items WHERE id = 1").fetchone() == (expected_title,)
+    assert manager.alter_index(definition(("price",))).indexes[0].columns == (IndexColumn("price"),)

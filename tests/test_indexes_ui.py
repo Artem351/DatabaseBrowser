@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import QDialogButtonBox, QMessageBox
 
 from database_browser.controller import ConnectionController
 from database_browser.errors import ProfileStorageError
-from database_browser.schema.models import TableInfo
+from database_browser.schema.models import Index, IndexColumn, TableInfo
 from database_browser.schema.ui import IndexDialog
 from database_browser.services import ConnectionManager
 from database_browser.ui import MainWindow, NotificationManager
@@ -77,12 +77,26 @@ def save_button(dialog):
     return dialog.buttons.button(QDialogButtonBox.StandardButton.Save)
 
 
+def save_dialog(qtbot, window, dialog, operation="schema.create"):
+    return wait_operation(
+        qtbot, window.controller, operation,
+        lambda: qtbot.mouseClick(save_button(dialog), Qt.MouseButton.LeftButton),
+    )
+
+
+def delete_selected(qtbot, window):
+    return wait_operation(
+        qtbot, window.controller, "schema.delete",
+        lambda: qtbot.mouseClick(window.schema_tab.btn_delete, Qt.MouseButton.LeftButton),
+    )
+
+
 def test_uc06_creates_index_and_selects_it_in_schema(qtbot, window, index_database):
     open_database(qtbot, window, index_database)
     tab = window.schema_tab
     dialog = fill_dialog(qtbot, tab)
     assert '"category" ASC' in dialog.preview_edit.toPlainText()
-    assert wait_operation(qtbot, window.controller, "schema.create", lambda: qtbot.mouseClick(save_button(dialog), Qt.MouseButton.LeftButton))
+    assert save_dialog(qtbot, window, dialog)
     assert tab.index_dialog is None
     assert tab.selected_index().name == "ix_category"
     assert "CREATE INDEX" in tab.details_edit.toPlainText()
@@ -109,7 +123,7 @@ def test_uc06_success_does_not_depend_on_profile_storage(qtbot, window, index_da
 
     # A schema write does not change profiles, so their storage is not needed here.
     monkeypatch.setattr(ConnectionManager, "list_connections", unavailable_profiles)
-    assert wait_operation(qtbot, window.controller, "schema.create", lambda: qtbot.mouseClick(save_button(dialog), Qt.MouseButton.LeftButton))
+    assert save_dialog(qtbot, window, dialog)
     assert window.schema_tab.index_dialog is None
     assert window.schema_tab.selected_index().name == "ix_category"
 
@@ -122,7 +136,7 @@ def test_uc06_error_keeps_form_and_allows_correction(qtbot, window, index_databa
     open_database(qtbot, window, index_database)
     tab = window.schema_tab
     dialog = fill_dialog(qtbot, tab, unique=failure == "unique_values")
-    assert not wait_operation(qtbot, window.controller, "schema.create", lambda: qtbot.mouseClick(save_button(dialog), Qt.MouseButton.LeftButton))
+    assert not save_dialog(qtbot, window, dialog)
     assert tab.index_dialog is dialog
     assert dialog.isVisible()
     assert dialog.name_edit.text() == "ix_category"
@@ -131,7 +145,7 @@ def test_uc06_error_keeps_form_and_allows_correction(qtbot, window, index_databa
     assert save_button(dialog).isEnabled()
     dialog.name_edit.setText("ix_corrected")
     dialog.unique_check.setChecked(False)
-    assert wait_operation(qtbot, window.controller, "schema.create", lambda: qtbot.mouseClick(save_button(dialog), Qt.MouseButton.LeftButton))
+    assert save_dialog(qtbot, window, dialog)
     assert tab.selected_index().name == "ix_corrected"
 
 
@@ -166,7 +180,7 @@ def test_editor_preserves_column_order_and_direction(qtbot):
 def test_switching_database_clears_old_indexes(qtbot, window, index_database, database_factory):
     open_database(qtbot, window, index_database)
     dialog = fill_dialog(qtbot, window.schema_tab)
-    assert wait_operation(qtbot, window.controller, "schema.create", lambda: qtbot.mouseClick(save_button(dialog), Qt.MouseButton.LeftButton))
+    assert save_dialog(qtbot, window, dialog)
     open_database(qtbot, window, database_factory("other.sqlite3"))
     assert not window.schema_tab.snapshot.indexes
     assert window.schema_tab.snapshot.tables[0].name == "sample"
@@ -209,6 +223,7 @@ def test_read_only_connection_allows_viewing_only(qtbot, window, index_database)
     assert not window.schema_tab.btn_create.isEnabled()
     assert window.schema_tab.selected_index().name == "ix_label"
     assert not window.schema_tab.btn_delete.isEnabled()
+    assert not window.schema_tab.btn_edit.isEnabled()
 
 
 def test_worker_disables_actions_until_operation_finishes(qtbot, window, index_database):
@@ -261,7 +276,7 @@ def test_uc08_confirmation_deletes_index_but_keeps_rows(qtbot, window, index_dat
 
     monkeypatch.setattr(QMessageBox, "question", confirm)
     assert tab.btn_delete.isEnabled()
-    assert wait_operation(qtbot, window.controller, "schema.delete", lambda: qtbot.mouseClick(tab.btn_delete, Qt.MouseButton.LeftButton))
+    assert delete_selected(qtbot, window)
     assert tab.indexes_list.count() == 0
     assert not tab.btn_delete.isEnabled()
     with closing(sqlite3.connect(index_database)) as connection:
@@ -303,8 +318,120 @@ def test_uc08_missing_index_refreshes_list_and_keeps_error(qtbot, window, index_
         return QMessageBox.StandardButton.Yes
 
     monkeypatch.setattr(QMessageBox, "question", remove_elsewhere)
-    assert not wait_operation(qtbot, window.controller, "schema.delete", lambda: qtbot.mouseClick(window.schema_tab.btn_delete, Qt.MouseButton.LeftButton))
+    assert not delete_selected(qtbot, window)
     qtbot.waitUntil(lambda: not window.controller.busy, timeout=5000)
     assert window.schema_tab.indexes_list.count() == 0
     assert "does not exist" in window.schema_tab.message_label.text()
     assert not window.connection_errors
+
+
+def test_uc07_form_loads_existing_index_and_keeps_name_and_table(qtbot):
+    index = Index(' ix "ordered" ', "items", (IndexColumn("label", True), IndexColumn("category")), True)
+    dialog = IndexDialog((TableInfo("items", ("id", "category", "label")),), index=index)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    assert dialog.name_edit.text() == index.name
+    assert dialog.table_combo.currentText() == "items"
+    assert dialog.unique_check.isChecked()
+    assert dialog.get_index().columns == index.columns
+    dialog.set_busy(True)
+    dialog.set_busy(False)
+    assert not dialog.name_edit.isEnabled()
+    assert not dialog.table_combo.isEnabled()
+    assert dialog.get_index().name == index.name
+
+
+def test_uc07_changes_columns_and_updates_selected_definition(qtbot, window, index_database):
+    with closing(sqlite3.connect(index_database)) as connection:
+        connection.execute("CREATE INDEX ix_items ON items(category)")
+    open_database(qtbot, window, index_database)
+    tab = window.schema_tab
+    qtbot.mouseClick(tab.btn_edit, Qt.MouseButton.LeftButton)
+    dialog = tab.index_dialog
+    dialog.unique_check.setChecked(True)
+    for row in range(dialog.columns_table.rowCount()):
+        item = dialog.columns_table.item(row, 0)
+        item.setCheckState(Qt.CheckState.Checked if item.text() == "label" else Qt.CheckState.Unchecked)
+        if item.text() == "label":
+            dialog.columns_table.cellWidget(row, 1).setCurrentText("DESC")
+    assert save_dialog(qtbot, window, dialog, "schema.edit")
+    assert tab.index_dialog is None
+    assert tab.selected_index().name == "ix_items"
+    assert tab.selected_index().columns == (IndexColumn("label", True),)
+    assert tab.selected_index().unique
+    with closing(sqlite3.connect(index_database)) as connection:
+        assert connection.execute('SELECT name, "desc" FROM pragma_index_xinfo(\'ix_items\') WHERE "key"=1').fetchall() == [("label", 1)]
+
+
+def test_uc07_unique_error_restores_old_index_and_preserves_form(qtbot, window, index_database):
+    with closing(sqlite3.connect(index_database)) as connection:
+        connection.execute("CREATE INDEX ix_items ON items(category)")
+        original_sql = connection.execute("SELECT sql FROM sqlite_schema WHERE name='ix_items'").fetchone()[0]
+    open_database(qtbot, window, index_database)
+    tab = window.schema_tab
+    qtbot.mouseClick(tab.btn_edit, Qt.MouseButton.LeftButton)
+    dialog = tab.index_dialog
+    dialog.unique_check.setChecked(True)
+    assert not save_dialog(qtbot, window, dialog, "schema.edit")
+    qtbot.waitUntil(lambda: not window.controller.busy, timeout=5000)
+    assert dialog.isVisible()
+    assert dialog.unique_check.isChecked()
+    assert dialog.validation_label.text()
+    assert not tab.selected_index().unique
+    assert not window.connection_errors
+    assert "UNIQUE" in tab.message_label.text()
+    with closing(sqlite3.connect(index_database)) as connection:
+        assert connection.execute("SELECT sql FROM sqlite_schema WHERE name='ix_items'").fetchone()[0] == original_sql
+    dialog.unique_check.setChecked(False)
+    assert save_dialog(qtbot, window, dialog, "schema.edit")
+    assert tab.index_dialog is None
+
+
+def test_uc07_cancel_keeps_old_definition(qtbot, window, index_database):
+    with closing(sqlite3.connect(index_database)) as connection:
+        connection.execute("CREATE INDEX ix_items ON items(category)")
+    open_database(qtbot, window, index_database)
+    before = window.schema_tab.selected_index()
+    qtbot.mouseClick(window.schema_tab.btn_edit, Qt.MouseButton.LeftButton)
+    dialog = window.schema_tab.index_dialog
+    dialog.unique_check.setChecked(True)
+    qtbot.mouseClick(dialog.buttons.button(QDialogButtonBox.StandardButton.Cancel), Qt.MouseButton.LeftButton)
+    assert window.schema_tab.index_dialog is None
+    assert not window.controller.busy
+    assert window.schema_tab.selected_index() == before
+    with closing(sqlite3.connect(index_database)) as connection:
+        assert connection.execute("SELECT sql FROM sqlite_schema WHERE name='ix_items'").fetchone()[0] == before.sql
+
+
+@pytest.mark.parametrize("sql", [
+    "CREATE TABLE protected(code TEXT PRIMARY KEY)",
+    "CREATE INDEX ix_special ON items(category) WHERE id > 1",
+    "CREATE INDEX ix_special ON items(lower(label))",
+    "CREATE INDEX ix_special ON items(label COLLATE NOCASE)",
+    "CREATE INDEX ix_special ON items(label COLLATE BINARY)",
+])
+def test_uc07_protected_and_special_indexes_cannot_be_edited(qtbot, window, index_database, sql):
+    with closing(sqlite3.connect(index_database)) as connection:
+        connection.execute(sql)
+    open_database(qtbot, window, index_database)
+    tab = window.schema_tab
+    assert tab.selected_index() is not None
+    assert not tab.btn_edit.isEnabled()
+    assert tab.btn_delete.isEnabled() == tab.selected_index().is_user_created
+    assert "UC-04" in tab.details_edit.toPlainText() or "cannot be edited" in tab.details_edit.toPlainText()
+
+
+def test_uc07_disappeared_index_keeps_form_and_refreshes_schema(qtbot, window, index_database):
+    with closing(sqlite3.connect(index_database)) as connection:
+        connection.execute("CREATE INDEX ix_items ON items(category)")
+    open_database(qtbot, window, index_database)
+    tab = window.schema_tab
+    qtbot.mouseClick(tab.btn_edit, Qt.MouseButton.LeftButton)
+    dialog = tab.index_dialog
+    with closing(sqlite3.connect(index_database)) as connection:
+        connection.execute("DROP INDEX ix_items")
+    assert not save_dialog(qtbot, window, dialog, "schema.edit")
+    qtbot.waitUntil(lambda: not window.controller.busy, timeout=5000)
+    assert dialog.isVisible()
+    assert tab.indexes_list.count() == 0
+    assert "does not exist" in dialog.validation_label.text()

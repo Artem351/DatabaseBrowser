@@ -21,11 +21,12 @@ class IndexDialog(QDialog):
 
     submitted = pyqtSignal(object)
 
-    def __init__(self, tables: tuple[TableInfo, ...], parent=None):
+    def __init__(self, tables: tuple[TableInfo, ...], parent=None, index: Index | None = None):
         super().__init__(parent)
         self._tables = tables
+        self._index = index
         self._busy = False
-        self.setWindowTitle("Create index")
+        self.setWindowTitle("Edit index" if index is not None else "Create index")
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.resize(720, 620)
 
@@ -87,12 +88,22 @@ class IndexDialog(QDialog):
         self.unique_check.toggled.connect(self._update_preview)
         self.columns_table.itemChanged.connect(self._update_preview)
         self.columns_table.currentCellChanged.connect(self._update_move_buttons)
+        if index is not None:
+            self.name_edit.setText(index.name)
+            self.table_combo.setCurrentText(index.table_name)
+            self.unique_check.setChecked(index.unique)
         self._show_columns()
+        self.set_busy(False)
 
     def _show_columns(self, *_):
         name = self.table_combo.currentText()
         table = next((table for table in self._tables if table.name == name), None)
         rows = [(column, False, False) for column in table.columns] if table else []
+        if self._index is not None and self._index.table_name == name:
+            # Keep the stored key order, which can differ from the table's order.
+            selected = {column.name for column in self._index.columns}
+            rows = [(column.name, True, column.descending) for column in self._index.columns]
+            rows.extend((column, False, False) for column in table.columns if column not in selected)
         self._fill_columns(rows)
 
     def _fill_columns(self, rows: list[tuple[str, bool, bool]], selected_row: int = -1):
@@ -140,7 +151,9 @@ class IndexDialog(QDialog):
     def get_index(self) -> Index:
         columns = tuple(IndexColumn(name, descending) for name, checked, descending in self._column_rows() if checked)
         return Index(
-            name=self.name_edit.text().strip(), table_name=self.table_combo.currentText(),
+            # Existing names can contain leading/trailing spaces and must stay exact.
+            name=self._index.name if self._index is not None else self.name_edit.text().strip(),
+            table_name=self._index.table_name if self._index is not None else self.table_combo.currentText(),
             columns=columns, unique=self.unique_check.isChecked(),
         )
 
@@ -176,8 +189,10 @@ class IndexDialog(QDialog):
 
     def set_busy(self, busy: bool):
         self._busy = busy
-        for widget in (self.table_combo, self.name_edit, self.unique_check, self.columns_table, self.buttons):
+        for widget in (self.unique_check, self.columns_table, self.buttons):
             widget.setEnabled(not busy)
+        self.table_combo.setEnabled(not busy and self._index is None)
+        self.name_edit.setEnabled(not busy and self._index is None)
         self._update_move_buttons()
 
     def reject(self):
@@ -202,12 +217,15 @@ class SchemaTab(QWidget):
         self.active_label.setWordWrap(True)
         self.btn_refresh = QPushButton("Refresh")
         self.btn_create = QPushButton("Create index…")
+        self.btn_edit = QPushButton("Edit index…")
         self.btn_delete = QPushButton("Delete index…")
         self.btn_refresh.clicked.connect(self.refresh)
         self.btn_create.clicked.connect(self._new_index)
+        self.btn_edit.clicked.connect(self._edit_index)
         self.btn_delete.clicked.connect(self._delete_index)
         buttons = QHBoxLayout()
         buttons.addWidget(self.btn_create)
+        buttons.addWidget(self.btn_edit)
         buttons.addWidget(self.btn_delete)
         buttons.addWidget(self.btn_refresh)
         buttons.addStretch()
@@ -263,6 +281,10 @@ class SchemaTab(QWidget):
         self.btn_refresh.setEnabled(available)
         self.btn_create.setEnabled(available and not active.read_only and bool(self.snapshot.tables))
         selected = self.selected_index()
+        self.btn_edit.setEnabled(
+            available and not active.read_only and selected is not None and selected.can_edit
+        )
+        self.btn_edit.setToolTip("Table constraints and special index definitions cannot be edited in this form.")
         self.btn_delete.setEnabled(
             available and not active.read_only and selected is not None and selected.is_user_created
         )
@@ -286,27 +308,27 @@ class SchemaTab(QWidget):
         if name == "connect" and success:
             # Reopening the same file can still reveal changes made elsewhere.
             self._needs_refresh = self.controller.active is not None
-        if name == "schema.delete" and not success:
+        if name in {"schema.delete", "schema.edit"} and not success:
             # Another application may have changed the schema since our last read.
             self._needs_refresh = self.controller.active is not None
         if name != "shutdown" and self._needs_refresh:
             self.refresh()
 
     def _operation_result(self, name: str, result):
-        if name not in {"schema.refresh", "schema.create", "schema.delete"}:
+        if name not in {"schema.refresh", "schema.create", "schema.delete", "schema.edit"}:
             return
         selected_name = None
-        if name == "schema.create" and self.index_dialog is not None:
+        if name in {"schema.create", "schema.edit"} and self.index_dialog is not None:
             selected_name = self.index_dialog.get_index().name
         self._show_snapshot(result, selected_name)
-        if name in {"schema.create", "schema.delete"}:
+        if name in {"schema.create", "schema.delete", "schema.edit"}:
             self._refresh_error = None
-            verb = "created" if name == "schema.create" else "deleted"
+            verb = {"schema.create": "created", "schema.delete": "deleted", "schema.edit": "updated"}[name]
             message = f"Index {verb}."
             if result.in_transaction:
                 message = f"Index {verb} in the current transaction. Commit it to save the change."
             self.message_label.setText(message)
-            if name == "schema.create" and self.index_dialog is not None:
+            if name in {"schema.create", "schema.edit"} and self.index_dialog is not None:
                 self.index_dialog.accept()
         elif self._refresh_error:
             self.message_label.setText(self._refresh_error)
@@ -320,11 +342,11 @@ class SchemaTab(QWidget):
         if not name.startswith("schema."):
             return
         self.message_label.setText(message)
-        if name == "schema.delete":
+        if name in {"schema.delete", "schema.edit"}:
             self._refresh_error = message
         elif name == "schema.refresh":
             self._refresh_error = None
-        if name == "schema.create" and self.index_dialog is not None:
+        if name in {"schema.create", "schema.edit"} and self.index_dialog is not None:
             self.index_dialog.show_error(message)
 
     def _show_snapshot(self, snapshot: SchemaSnapshot, selected_name: str | None = None):
@@ -379,13 +401,22 @@ class SchemaTab(QWidget):
     def _new_index(self):
         if not self.btn_create.isEnabled():
             return
+        self._open_index_dialog()
+
+    def _edit_index(self):
+        index = self.selected_index()
+        if index is None or not self.btn_edit.isEnabled():
+            return
+        self._open_index_dialog(index)
+
+    def _open_index_dialog(self, index: Index | None = None):
         if self.index_dialog is not None:
             self.index_dialog.raise_()
             self.index_dialog.activateWindow()
             return
-        dialog = IndexDialog(self.snapshot.tables, self)
+        dialog = IndexDialog(self.snapshot.tables, self, index=index)
         self.index_dialog = dialog
-        dialog.submitted.connect(self._create_index)
+        dialog.submitted.connect(self._alter_index if index is not None else self._create_index)
         dialog.finished.connect(lambda _: self._dialog_closed(dialog))
         dialog.open()
 
@@ -398,6 +429,14 @@ class SchemaTab(QWidget):
         accepted = self.controller.submit_database_operation(
             "schema.create",
             lambda manager: SchemaManager(SQLiteIndexRepository(manager.executor.connection)).create_index(index),
+        )
+        if not accepted and self.index_dialog is not None:
+            self.index_dialog.show_error("Another database operation is running. Try again when it finishes.")
+
+    def _alter_index(self, index: Index):
+        accepted = self.controller.submit_database_operation(
+            "schema.edit",
+            lambda manager: SchemaManager(SQLiteIndexRepository(manager.executor.connection)).alter_index(index),
         )
         if not accepted and self.index_dialog is not None:
             self.index_dialog.show_error("Another database operation is running. Try again when it finishes.")

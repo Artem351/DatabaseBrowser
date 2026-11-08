@@ -13,7 +13,7 @@ from .ui import MainWindow
 
 def main() -> int:
     """Create the controller and window, then start the Qt event loop."""
-    parser = argparse.ArgumentParser(description="Database Browser connection management")
+    parser = argparse.ArgumentParser(description="Database Browser for SQLite")
     parser.add_argument("--data-dir", type=Path, help="Override the directory for saved connection profiles")
     args = parser.parse_args()
     app = QApplication(sys.argv[:1])
