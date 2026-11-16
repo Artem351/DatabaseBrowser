@@ -130,7 +130,7 @@ class DatabaseTab(QWidget):
         controller.profiles_changed.connect(self._show_profiles)
         controller.connection_changed.connect(self._show_connection)
         controller.busy_changed.connect(self._set_busy)
-        controller.error_occurred.connect(self._show_error)
+        controller.operation_failed.connect(self._operation_error)
         controller.operation_finished.connect(self._operation_finished)
         self._show_profiles(controller.profiles)
         self._set_busy(controller.busy)
@@ -192,6 +192,11 @@ class DatabaseTab(QWidget):
         """Keep the error on the tab and show a separate message."""
         self.message_label.setText(message)
         NotificationManager.show_error(self, message)
+
+    def _operation_error(self, name: str, message: str):
+        # Schema errors belong to their own tab and should only be shown once.
+        if not name.startswith("schema."):
+            self._show_error(message)
 
     def _operation_finished(self, name: str, success: bool):
         """Show the result message after a successful operation."""
@@ -256,8 +261,12 @@ class MainWindow(QMainWindow):
         self.tab_widget = QTabWidget()
         self.database_tab = DatabaseTab(controller)
         self.tab_widget.addTab(self.database_tab, "Database")
+        from .schema.ui import SchemaTab
+
+        self.schema_tab = SchemaTab(controller)
+        self.tab_widget.addTab(self.schema_tab, "Schema")
         # The team will add the other use cases as separate modules.
-        for name in ["Schema", "SQL Editor", "Query Plan"]:
+        for name in ["SQL Editor", "Query Plan"]:
             index = self.tab_widget.addTab(QWidget(), name)
             self.tab_widget.setTabEnabled(index, False)
         self.setCentralWidget(self.tab_widget)
