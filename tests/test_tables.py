@@ -521,16 +521,178 @@ def test_uc04_self_reference_and_composite_primary_key_round_trip(table_db):
         connection.execute("INSERT INTO tree(id, parent) VALUES (3, 99)")
 
 
-def test_uc04_index_on_a_renamed_or_removed_column_is_explained(table_db):
+def test_uc04_index_follows_a_renamed_column_and_blocks_removal(table_db):
     _, connection, manager = table_db
     notes = editing(get(manager, "notes"))
-    before = schema_state(connection)
     renamed = tuple(replace(c, name="label") if c.name == "tag" else c for c in notes.columns)
-    with pytest.raises(TableOperationError, match='Index "ix_notes_tag" uses column "tag"'):
-        manager.alter_table(replace(notes, columns=renamed))
-    with pytest.raises(TableOperationError, match="Index"):
-        manager.alter_table(replace(notes, columns=tuple(c for c in notes.columns if c.name != "tag")))
+    manager.alter_table(replace(notes, columns=renamed))
+    sql = connection.execute("SELECT sql FROM sqlite_schema WHERE name = 'ix_notes_tag'").fetchone()[0]
+    assert '("label")' in sql
+    notes = editing(get(manager, "notes"))
+    before = schema_state(connection)
+    with pytest.raises(TableOperationError, match='Index "ix_notes_tag" uses column "label"'):
+        manager.alter_table(replace(notes, columns=tuple(c for c in notes.columns if c.name != "label")))
     assert schema_state(connection) == before
+
+
+def rename(table, old, new):
+    return replace(table, columns=tuple(replace(c, name=new) if c.name == old else c for c in table.columns))
+
+
+def test_uc04_rename_keeps_check_constraints_working(table_db):
+    _, connection, manager = table_db
+    connection.execute(
+        "CREATE TABLE scores(id INTEGER PRIMARY KEY, points INTEGER CHECK (points >= 0), bonus INTEGER, "
+        "CHECK (points + bonus < 1000))"
+    )
+    connection.execute("INSERT INTO scores VALUES (1, 5, 1)")
+    connection.commit()
+    manager.alter_table(rename(editing(get(manager, "scores")), "points", "score"))
+    checks = [c.expression for c in get(manager, "scores").constraints if c.kind == CHECK]
+    assert len(checks) == 2 and not any("points" in expression for expression in checks)
+    assert connection.execute("SELECT id, score, bonus FROM scores").fetchall() == [(1, 5, 1)]
+    for sql in ("INSERT INTO scores VALUES (2, -1, 0)", "INSERT INTO scores VALUES (3, 999, 5)"):
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            connection.execute(sql)
+    # The rewritten constraints survive another edit.
+    manager.alter_table(editing(get(manager, "scores")))
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        connection.execute("INSERT INTO scores VALUES (4, -1, 0)")
+
+
+def test_uc04_rename_keeps_a_checked_edit_of_the_constraint(table_db):
+    _, connection, manager = table_db
+    connection.execute("CREATE TABLE scores(id INTEGER PRIMARY KEY, points INTEGER CHECK (points >= 0))")
+    connection.commit()
+    table = rename(editing(get(manager, "scores")), "points", "score")
+    # The user replaced the old CHECK by one that already uses the new name.
+    edited = replace(table, constraints=(TableConstraint(CHECK, expression="score >= 10"),))
+    manager.alter_table(edited)
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        connection.execute("INSERT INTO scores VALUES (1, 5)")
+
+
+def test_uc04_rename_updates_views_triggers_and_indexes(table_db):
+    _, connection, manager = table_db
+    connection.execute("CREATE VIEW v_tags AS SELECT tag FROM notes")
+    connection.execute("CREATE TRIGGER tr_tag AFTER INSERT ON notes BEGIN INSERT INTO audit(msg) VALUES (NEW.tag); END")
+    connection.commit()
+    manager.alter_table(rename(editing(get(manager, "notes")), "tag", "label"))
+    assert connection.execute("SELECT * FROM v_tags ORDER BY 1").fetchall() == [("x",), ("z",)]
+    connection.execute("INSERT INTO notes(body, label) VALUES ('d', 'q')")
+    assert ("q",) in connection.execute("SELECT msg FROM audit").fetchall()
+    assert connection.execute("SELECT rowid, label FROM notes WHERE body = 'c'").fetchone() == (3, "z")
+
+
+def test_uc04_rename_follows_keys_and_keeps_foreign_key_column_order(table_db):
+    _, connection, manager = table_db
+    connection.execute("CREATE TABLE pk2(x INTEGER, y INTEGER, PRIMARY KEY (x, y))")
+    connection.execute(
+        "CREATE TABLE child(a INTEGER, b INTEGER, UNIQUE (b, a), FOREIGN KEY (b, a) REFERENCES pk2 (x, y))"
+    )
+    connection.execute("INSERT INTO pk2 VALUES (1, 2)")
+    connection.execute("INSERT INTO child VALUES (2, 1)")
+    connection.commit()
+    manager.alter_table(rename(editing(get(manager, "child")), "a", "a2"))
+    after = get(manager, "child")
+    assert TableConstraint(UNIQUE, columns=("b", "a2")) in after.constraints
+    assert TableConstraint(FOREIGN_KEY, columns=("b", "a2"), ref_table="pk2", ref_columns=("x", "y")) in after.constraints
+    assert connection.execute("SELECT a2, b FROM child").fetchall() == [(2, 1)]
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute("INSERT INTO child VALUES (9, 9)")
+
+
+def test_uc04_composite_foreign_key_order_is_kept_on_create_and_edit(table_db):
+    _, _, manager = table_db
+    manager.create_table(new_table("parent2", [ColumnDef("x", "INTEGER"), ColumnDef("y", "INTEGER")], [
+        TableConstraint(PRIMARY_KEY, columns=("x", "y")),
+    ]))
+    key = TableConstraint(FOREIGN_KEY, columns=("b", "a"), ref_table="parent2", ref_columns=("y", "x"))
+    manager.create_table(new_table("kid", [ColumnDef("a", "INTEGER"), ColumnDef("b", "INTEGER")], [key]))
+    assert get(manager, "kid").constraints == (key,)
+    manager.alter_table(editing(get(manager, "kid")))
+    assert get(manager, "kid").constraints == (key,)
+
+
+@pytest.mark.parametrize("scenario, message", [
+    ("swap", "Cannot rename"),
+    ("reuse_removed", "Cannot rename"),
+    ("reuse_vacated", "was used by a column that is renamed"),
+])
+def test_uc04_ambiguous_renames_are_refused(table_db, scenario, message):
+    _, connection, manager = table_db
+    connection.execute("CREATE TABLE pair(a INTEGER, b INTEGER, c INTEGER)")
+    connection.execute("INSERT INTO pair VALUES (1, 2, 3)")
+    connection.commit()
+    pair = editing(get(manager, "pair"))
+    a, b, c = pair.columns
+    columns = {
+        "swap": (replace(a, name="b"), replace(b, name="a"), c),
+        "reuse_removed": (replace(a, name="c"), b),
+        "reuse_vacated": (replace(a, name="x"), b, c, ColumnDef("a", "TEXT")),
+    }[scenario]
+    before = schema_state(connection)
+    with pytest.raises(TableOperationError, match=message):
+        manager.alter_table(replace(pair, columns=columns))
+    assert schema_state(connection) == before
+    assert connection.execute("SELECT a, b, c FROM pair").fetchall() == [(1, 2, 3)]
+
+
+def test_uc04_row_ids_survive_when_a_column_is_named_rowid(table_db):
+    _, connection, manager = table_db
+    connection.execute("CREATE TABLE r(rowid TEXT, v INTEGER)")
+    connection.execute("INSERT INTO r(oid, rowid, v) VALUES (10, 'a', 1), (20, 'b', 2)")
+    connection.commit()
+    r = editing(get(manager, "r"))
+    manager.alter_table(replace(r, columns=r.columns + (ColumnDef("w", "TEXT"),)))
+    assert connection.execute("SELECT oid, rowid, v FROM r ORDER BY oid").fetchall() == [(10, "a", 1), (20, "b", 2)]
+
+
+def test_uc04_row_ids_survive_when_the_integer_primary_key_is_removed(table_db):
+    _, connection, manager = table_db
+    connection.execute("CREATE TABLE p(id INTEGER PRIMARY KEY, v TEXT)")
+    connection.execute("INSERT INTO p VALUES (10, 'a'), (20, 'b')")
+    connection.commit()
+    p = editing(get(manager, "p"))
+    manager.alter_table(replace(p, columns=tuple(replace(c, primary_key=False) if c.name == "id" else c for c in p.columns)))
+    assert connection.execute("SELECT rowid, id FROM p ORDER BY rowid").fetchall() == [(10, 10), (20, 20)]
+
+
+def test_uc04_row_ids_that_no_name_can_reach_are_not_silently_renumbered(table_db):
+    _, connection, manager = table_db
+    connection.execute("CREATE TABLE hidden(rowid, oid, _rowid_, v)")
+    connection.execute("INSERT INTO hidden(rowid, oid, _rowid_, v) VALUES (1, 2, 3, 4)")
+    connection.commit()
+    hidden = editing(get(manager, "hidden"))
+    changed = replace(hidden, columns=hidden.columns + (ColumnDef("w"),))
+    before = schema_state(connection)
+    with pytest.raises(TableOperationError, match="row ids cannot be preserved"):
+        manager.alter_table(changed)
+    assert schema_state(connection) == before
+    connection.execute("DELETE FROM hidden")
+    connection.commit()
+    manager.alter_table(changed)  # nothing to renumber
+    assert [c.name for c in get(manager, "hidden").columns][-1] == "w"
+
+
+def test_uc04_dropping_a_column_that_a_view_uses_is_refused(table_db):
+    _, connection, manager = table_db
+    authors = editing(get(manager, "authors"))
+    before = schema_state(connection)
+    with pytest.raises(TableOperationError, match='View "v_authors" would stop working'):
+        manager.alter_table(replace(authors, columns=tuple(c for c in authors.columns if c.name != "name")))
+    assert schema_state(connection) == before
+    assert connection.execute("SELECT * FROM v_authors").fetchall() == [(1, "Ann")]
+    assert connection.execute("PRAGMA foreign_keys").fetchone() == (1,)
+
+
+def test_uc04_views_that_were_already_broken_do_not_block_other_changes(table_db):
+    _, connection, manager = table_db
+    connection.execute("CREATE VIEW v_gone AS SELECT * FROM missing_table")
+    connection.commit()
+    audit = editing(get(manager, "audit"))
+    manager.alter_table(replace(audit, columns=audit.columns + (ColumnDef("extra", "TEXT"),)))
+    assert [c.name for c in get(manager, "audit").columns] == ["msg", "extra"]
 
 
 def test_uc04_foreign_key_needing_missing_parents_is_rejected(table_db):

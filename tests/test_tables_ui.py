@@ -379,6 +379,97 @@ def test_uc04_tables_the_form_cannot_keep_are_view_only(qtbot, window, table_dat
     assert tab.btn_edit.isEnabled()
 
 
+def tick(dialog, name, checked=True):
+    for row in range(dialog.columns_list.count()):
+        item = dialog.columns_list.item(row)
+        if item.text() == name:
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            return
+    raise AssertionError(f"{name} is not offered")
+
+
+@pytest.mark.parametrize("existing", [
+    TableConstraint(FOREIGN_KEY, columns=("b", "a"), ref_table="parent", ref_columns=("x", "y")),
+    TableConstraint(UNIQUE, columns=("b", "a")),
+    TableConstraint(PRIMARY_KEY, columns=("b", "a")),
+])
+def test_constraint_form_keeps_the_column_order_of_a_loaded_key(qtbot, existing):
+    dialog = ConstraintDialog(("a", "b"), ("parent",), "t", constraint=existing)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    accepted = []
+    dialog.accepted.connect(lambda: accepted.append(True))
+    qtbot.mouseClick(dialog.buttons.button(QDialogButtonBox.StandardButton.Ok), Qt.MouseButton.LeftButton)
+    assert accepted
+    assert dialog.get_constraint() == existing
+
+
+def test_constraint_form_orders_a_new_key_by_ticking(qtbot):
+    dialog = ConstraintDialog(("a", "b", "c"), (), "t")
+    qtbot.addWidget(dialog)
+    dialog.show()
+    dialog.kind_combo.setCurrentText(UNIQUE)
+    for name in ("c", "a", "b"):
+        tick(dialog, name)
+    assert dialog.get_constraint().columns == ("c", "a", "b")
+    tick(dialog, "a", False)
+    assert dialog.get_constraint().columns == ("c", "b")
+    tick(dialog, "a")
+    assert dialog.get_constraint().columns == ("c", "b", "a")
+
+
+def test_constraint_form_keeps_the_stored_spelling_of_the_referenced_table(qtbot):
+    existing = TableConstraint(FOREIGN_KEY, columns=("a",), ref_table="Parent", ref_columns=("x",))
+    dialog = ConstraintDialog(("a",), ("parent",), "t", constraint=existing)
+    qtbot.addWidget(dialog)
+    assert [dialog.ref_table_combo.itemText(i) for i in range(dialog.ref_table_combo.count())] == ["parent", "t"]
+    assert dialog.ref_table_combo.currentText() == "parent"
+    assert dialog.get_constraint() == existing
+
+
+def test_constraint_form_warns_when_a_key_column_is_gone(qtbot):
+    dialog = ConstraintDialog(("a", "b"), (), "t", constraint=TableConstraint(UNIQUE, columns=("a", "gone")))
+    qtbot.addWidget(dialog)
+    assert "gone" in dialog.validation_label.text()
+    assert dialog.get_constraint().columns == ("a",)
+
+
+def test_edit_form_shows_constraints_with_the_new_names_of_renamed_columns(qtbot, monkeypatch):
+    table = stored_table("items", [ColumnDef("a", "INTEGER"), ColumnDef("b", "INTEGER")], [
+        TableConstraint(UNIQUE, columns=("b", "a")),
+    ])
+    dialog = TableDialog((), table=table)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    dialog.columns_table.item(0, COL_NAME).setText("z")
+    seen = []
+
+    def look(self):
+        seen.append(self.checked_columns())
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(ConstraintDialog, "exec", look)
+    dialog.constraints_table.setCurrentCell(0, 0)
+    qtbot.mouseClick(dialog.btn_edit_constraint, Qt.MouseButton.LeftButton)
+    assert seen == [("b", "z")]
+
+
+def test_uc04_rename_keeps_check_and_view_working(qtbot, window, table_database):
+    with closing(sqlite3.connect(table_database)) as connection, connection:
+        connection.execute("CREATE TABLE scores(id INTEGER PRIMARY KEY, points INTEGER CHECK (points >= 0))")
+        connection.execute("INSERT INTO scores VALUES (1, 5)")
+        connection.execute("CREATE VIEW v_points AS SELECT points FROM scores")
+    open_database(qtbot, window, table_database)
+    tab = window.schema_tab.tables_tab
+    dialog = open_edit_dialog(qtbot, tab, "scores")
+    dialog.columns_table.item(1, COL_NAME).setText("score")
+    assert save_dialog(qtbot, window, dialog, ALTER)
+    with closing(sqlite3.connect(table_database)) as connection:
+        assert connection.execute("SELECT score FROM v_points").fetchall() == [(5,)]
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            connection.execute("INSERT INTO scores VALUES (2, -1)")
+
+
 # ---------------------------------------------------------------- UC-05
 
 

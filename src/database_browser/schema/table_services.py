@@ -186,12 +186,24 @@ class TableManager:
                 if not old.editable:
                     raise TableOperationError(old.reason or "This table cannot be edited with this form.")
                 new = replace(_normalized(definition), name=old.name)
+                copy_map = self._copy_map(old, new)
+                renames = self._renames(old, new)
+                # Constraints saved before a rename still name the old column.
+                new = self._follow_renames(new, renames)
                 others = tuple(t for t in tables if t is not old)
                 validate_definition(new, others)
-                copy_map = self._copy_map(old, new)
+                self._check_rename_targets(old, new, renames)
                 self._check_children(old, new, others)
                 self._check_data(old, new, copy_map)
+                broken_before = self.repository.broken_views()
+                if renames:
+                    # SQLite rewrites CHECK constraints, indexes, views and triggers that use the column.
+                    self.repository.rename_columns(old.name, renames)
+                    renamed = self.repository.find_by_name(old.name)
+                    new = self._after_rename(old, renamed, new, renames)
+                    old, copy_map = renamed, self._copy_map(renamed, new)
                 self.repository.update(old, new, copy_map, change)
+                self._check_views(broken_before)
                 snapshot = self._snapshot(outer_transaction)
             return snapshot
 
@@ -213,6 +225,89 @@ class TableManager:
             used.add(key)
             pairs.append((stored[key], column.name))
         return tuple(pairs)
+
+    @staticmethod
+    def _renames(old: TableDefinition, new: TableDefinition) -> tuple[tuple[str, str], ...]:
+        """Pairs (stored name, new name) for columns whose name changes beyond letter case."""
+        stored = {fold_name(column.name): column.name for column in old.columns}
+        return tuple(
+            (stored[fold_name(column.original_name)], column.name)
+            for column in new.columns
+            if column.original_name is not None and fold_name(column.original_name) in stored
+            and fold_name(column.original_name) != fold_name(column.name)
+        )
+
+    @staticmethod
+    def _follow_renames(new: TableDefinition, renames: tuple[tuple[str, str], ...]) -> TableDefinition:
+        """Point key and foreign key columns at the new names of renamed columns."""
+        if not renames:
+            return new
+        mapping = {fold_name(old_name): new_name for old_name, new_name in renames}
+
+        def follow(names: tuple[str, ...]) -> tuple[str, ...]:
+            return tuple(mapping.get(fold_name(name), name) for name in names)
+
+        constraints = []
+        for constraint in new.constraints:
+            if constraint.kind in {PRIMARY_KEY, UNIQUE}:
+                constraint = replace(constraint, columns=follow(constraint.columns))
+            elif constraint.kind == FOREIGN_KEY:
+                own = fold_name(constraint.ref_table or "") == fold_name(new.name)
+                constraint = replace(
+                    constraint, columns=follow(constraint.columns),
+                    ref_columns=follow(constraint.ref_columns) if own else constraint.ref_columns,
+                )
+            constraints.append(constraint)
+        return replace(new, constraints=tuple(constraints))
+
+    @staticmethod
+    def _check_rename_targets(old: TableDefinition, new: TableDefinition,
+                              renames: tuple[tuple[str, str], ...]) -> None:
+        """Refuse renames whose meaning would be ambiguous (swaps, reuse of a removed column's name)."""
+        stored = {fold_name(column.name) for column in old.columns}
+        vacated = {fold_name(old_name) for old_name, _ in renames}
+        for old_name, new_name in renames:
+            if fold_name(new_name) in stored:
+                raise TableOperationError(
+                    f'Cannot rename "{old_name}" to "{new_name}": the table has a column with that name now. '
+                    "Rename, swap or remove such columns in separate steps."
+                )
+        for column in new.columns:
+            keeps_name = column.original_name is not None and fold_name(column.original_name) == fold_name(column.name)
+            if fold_name(column.name) in vacated and not keeps_name:
+                raise TableOperationError(
+                    f'The name "{column.name}" was used by a column that is renamed in this change. '
+                    "Use it in a separate step."
+                )
+
+    @staticmethod
+    def _after_rename(old: TableDefinition, renamed: TableDefinition | None, new: TableDefinition,
+                      renames: tuple[tuple[str, str], ...]) -> TableDefinition:
+        """Adopt the names and CHECK texts that SQLite wrote while renaming."""
+        if renamed is None:
+            raise TableOperationError(f'Table "{old.name}" disappeared while it was being changed.')
+        done = {fold_name(old_name) for old_name, _ in renames}
+        columns = tuple(
+            replace(column, original_name=column.name)
+            if column.original_name is not None and fold_name(column.original_name) in done else column
+            for column in new.columns
+        )
+        before = [c.expression for c in old.constraints if c.kind == CHECK]
+        after = [c.expression for c in renamed.constraints if c.kind == CHECK]
+        rewritten = dict(zip(before, after)) if len(before) == len(after) else {}
+        constraints = tuple(
+            replace(c, expression=rewritten.get(c.expression, c.expression)) if c.kind == CHECK else c
+            for c in new.constraints
+        )
+        return replace(new, columns=columns, constraints=constraints)
+
+    def _check_views(self, broken_before: dict[str, str]) -> None:
+        """A change must not leave a working view broken."""
+        for name, reason in self.repository.broken_views().items():
+            if name not in broken_before:
+                raise TableOperationError(
+                    f'View "{name}" would stop working ({reason}). Change or delete the view first.'
+                )
 
     @staticmethod
     def _check_children(old: TableDefinition, new: TableDefinition, others: tuple[TableDefinition, ...]) -> None:

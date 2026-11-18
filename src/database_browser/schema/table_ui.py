@@ -1,5 +1,7 @@
 """Table list and the create/edit forms for the Schema tab (UC-03, UC-04, UC-05)."""
 
+from dataclasses import replace
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
@@ -76,6 +78,10 @@ class ConstraintDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Edit constraint" if constraint else "Add constraint")
         self.resize(520, 460)
+        self._initial = constraint
+        # Key columns keep the order they have in the constraint (or the order they are ticked in).
+        self._order: list[str] = []
+        self._missing: list[str] = []
         self.kind_combo = QComboBox()
         self.kind_combo.setObjectName("constraint_kind")
         self.kind_combo.addItems(CONSTRAINT_KINDS)
@@ -90,16 +96,12 @@ class ConstraintDialog(QDialog):
         self.columns_box = QWidget()
         box = QVBoxLayout(self.columns_box)
         box.setContentsMargins(0, 0, 0, 0)
-        box.addWidget(QLabel("Columns (the order follows the list):"))
+        box.addWidget(QLabel("Columns (in the order you tick them):"))
         box.addWidget(self.columns_list)
 
         names = list(ref_tables)
-        extra = [constraint.ref_table] if constraint and constraint.ref_table else []
-        if own_name:
-            extra.append(own_name)
-        for name in extra:
-            if all(fold_name(name) != fold_name(existing) for existing in names):
-                names.append(name)
+        if own_name and all(fold_name(own_name) != fold_name(existing) for existing in names):
+            names.append(own_name)
         self.ref_table_combo = QComboBox()
         self.ref_table_combo.setObjectName("constraint_ref_table")
         self.ref_table_combo.addItems(names)
@@ -145,7 +147,13 @@ class ConstraintDialog(QDialog):
         self.kind_combo.currentTextChanged.connect(self._kind_changed)
         if constraint is not None:
             self._load(constraint)
+        self.columns_list.itemChanged.connect(self._item_changed)
         self._kind_changed(self.kind_combo.currentText())
+        if self._missing:
+            self.validation_label.setText(
+                "Removed from this constraint because the table no longer has them: "
+                + ", ".join(self._missing) + ". Check the columns before pressing OK."
+            )
 
     @staticmethod
     def _action_combo(name: str) -> QComboBox:
@@ -157,16 +165,38 @@ class ConstraintDialog(QDialog):
 
     def _load(self, constraint: TableConstraint):
         self.kind_combo.setCurrentText(constraint.kind)
+        available = {self.columns_list.item(row).text() for row in range(self.columns_list.count())}
+        self.columns_list.blockSignals(True)
         for row in range(self.columns_list.count()):
             item = self.columns_list.item(row)
             if item.text() in constraint.columns:
                 item.setCheckState(Qt.CheckState.Checked)
+        self.columns_list.blockSignals(False)
+        self._order = [name for name in constraint.columns if name in available]
+        self._missing = [name for name in constraint.columns if name not in available]
         self.expression_edit.setText(constraint.expression or "")
         if constraint.ref_table:
-            self.ref_table_combo.setCurrentText(constraint.ref_table)
+            self._select_ref_table(constraint.ref_table)
         self.ref_columns_edit.setText(", ".join(constraint.ref_columns))
         self.on_delete_combo.setCurrentIndex(max(0, self.on_delete_combo.findData(constraint.on_delete)))
         self.on_update_combo.setCurrentIndex(max(0, self.on_update_combo.findData(constraint.on_update)))
+
+    def _select_ref_table(self, name: str):
+        # Match like SQLite does (ASCII case-insensitive) so a loaded constraint keeps its table.
+        for index in range(self.ref_table_combo.count()):
+            if fold_name(self.ref_table_combo.itemText(index)) == fold_name(name):
+                self.ref_table_combo.setCurrentIndex(index)
+                return
+        self.ref_table_combo.addItem(name)
+        self.ref_table_combo.setCurrentIndex(self.ref_table_combo.count() - 1)
+
+    def _item_changed(self, item: QListWidgetItem):
+        name = item.text()
+        if item.checkState() == Qt.CheckState.Checked:
+            if name not in self._order:
+                self._order.append(name)
+        elif name in self._order:
+            self._order.remove(name)
 
     def _kind_changed(self, kind: str):
         self.columns_box.setVisible(kind != CHECK)
@@ -175,11 +205,11 @@ class ConstraintDialog(QDialog):
         self.validation_label.clear()
 
     def checked_columns(self) -> tuple[str, ...]:
-        # Item text keeps the exact stored name; the check marks give the key order.
-        return tuple(
+        checked = {
             self.columns_list.item(row).text() for row in range(self.columns_list.count())
             if self.columns_list.item(row).checkState() == Qt.CheckState.Checked
-        )
+        }
+        return tuple(name for name in self._order if name in checked)
 
     def get_constraint(self) -> TableConstraint:
         kind = self.kind_combo.currentText()
@@ -187,9 +217,13 @@ class ConstraintDialog(QDialog):
             return TableConstraint(CHECK, expression=self.expression_edit.text().strip())
         if kind == FOREIGN_KEY:
             ref_columns = tuple(part.strip() for part in self.ref_columns_edit.text().split(",") if part.strip())
+            ref_table = self.ref_table_combo.currentText()
+            initial = self._initial.ref_table if self._initial is not None else None
+            if initial and fold_name(initial) == fold_name(ref_table):
+                ref_table = initial  # keep the spelling of the stored constraint
             return TableConstraint(
                 FOREIGN_KEY, columns=self.checked_columns(),
-                ref_table=self.ref_table_combo.currentText(), ref_columns=ref_columns,
+                ref_table=ref_table, ref_columns=ref_columns,
                 on_delete=self.on_delete_combo.currentData() or "",
                 on_update=self.on_update_combo.currentData() or "",
             )
@@ -386,6 +420,26 @@ class TableDialog(QDialog):
             self.constraints_table.setItem(row, 0, QTableWidgetItem(constraint.kind))
             self.constraints_table.setItem(row, 1, QTableWidgetItem(describe_constraint(constraint)))
 
+    def _follow_renames(self, constraint: TableConstraint) -> TableConstraint:
+        """Show a constraint with the current names of columns renamed in this form."""
+        mapping = {}
+        for row in range(self.columns_table.rowCount()):
+            item = self.columns_table.item(row, COL_NAME)
+            original = item.data(Qt.ItemDataRole.UserRole)
+            if original is not None and item.text().strip() and fold_name(original) != fold_name(item.text()):
+                mapping[fold_name(original)] = item.text()
+        if not mapping:
+            return constraint
+
+        def follow(names: tuple[str, ...]) -> tuple[str, ...]:
+            return tuple(mapping.get(fold_name(name), name) for name in names)
+
+        own = fold_name(constraint.ref_table or "") == fold_name(self._own_name())
+        return replace(
+            constraint, columns=follow(constraint.columns),
+            ref_columns=follow(constraint.ref_columns) if own else constraint.ref_columns,
+        )
+
     def _own_name(self) -> str:
         return self._table.name if self._table is not None else self.name_edit.text().strip()
 
@@ -396,7 +450,7 @@ class TableDialog(QDialog):
         if row is not None:
             if not 0 <= row < len(self._constraints):
                 return
-            existing = self._constraints[row]
+            existing = self._follow_renames(self._constraints[row])
         dialog = ConstraintDialog(self.column_names(), self._ref_tables, self._own_name(), self, existing)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             if row is None:

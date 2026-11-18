@@ -48,7 +48,7 @@ Python 3.14.6, SQLite 3.50.4, PyQt6/Qt 6.12.0, PyQt6-sip 13.13.0, pytest 8.4.2, 
 
 ## UC-03, UC-04, UC-05 (таблицы)
 
-Добавлены `tests/test_tables.py` (78 проверок логики) и `tests/test_tables_ui.py` (28 проверок интерфейса). Итог полного прогона: **245 passed**. В `tests/test_indexes_ui.py` в фикстуре `window` добавлена одна строка: вкладка Schema теперь содержит разделы Tables и Indexes, и тесты индексов выбирают раздел Indexes.
+Добавлены `tests/test_tables.py` (78 проверок логики) и `tests/test_tables_ui.py` (28 проверок интерфейса). Итог полного прогона: **266 passed**. В `tests/test_indexes_ui.py` в фикстуре `window` добавлена одна строка: вкладка Schema теперь содержит разделы Tables и Indexes, и тесты индексов выбирают раздел Indexes.
 
 
 `./.venv314/Scripts/python.exe -m pytest -q`

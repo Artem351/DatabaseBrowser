@@ -13,7 +13,13 @@ from .table_models import (
 from .table_parser import parse_create_table
 from .table_sql import create_table_sql, drop_table_sql, fold_name, is_rowid_alias, quote_name
 
-_ROWID_NAMES = {"rowid", "oid", "_rowid_"}
+_ROWID_NAMES = ("rowid", "oid", "_rowid_")
+
+
+def _free_rowid_name(columns) -> str | None:
+    """A name for the internal row id that no column of the table hides."""
+    taken = {fold_name(column.name) for column in columns}
+    return next((name for name in _ROWID_NAMES if name not in taken), None)
 
 
 class ITableRepository(Protocol):
@@ -25,6 +31,10 @@ class ITableRepository(Protocol):
     def find_by_name(self, name: str) -> TableDefinition | None: ...
 
     def has_rows(self, name: str) -> bool: ...
+
+    def broken_views(self) -> dict[str, str]: ...
+
+    def rename_columns(self, table: str, renames: tuple[tuple[str, str], ...]) -> None: ...
 
     def save(self, table: TableDefinition) -> None: ...
 
@@ -167,7 +177,27 @@ class SQLiteTableRepository:
     def has_rows(self, name: str) -> bool:
         return self.connection.execute(f"SELECT EXISTS (SELECT 1 FROM main.{quote_name(name)})").fetchone()[0] == 1
 
+    def broken_views(self) -> dict[str, str]:
+        """Views that cannot be prepared now, with SQLite's reason."""
+        names = [row[0] for row in self.connection.execute(
+            "SELECT name FROM main.sqlite_schema WHERE type = 'view' ORDER BY name"
+        )]
+        broken = {}
+        for name in names:
+            try:
+                self.connection.execute(f"SELECT * FROM main.{quote_name(name)} LIMIT 0").fetchall()
+            except sqlite3.Error as error:
+                broken[name] = str(error)
+        return broken
+
     # ----- writing -----
+
+    def rename_columns(self, table: str, renames: tuple[tuple[str, str], ...]) -> None:
+        """Let SQLite rename the columns; it also rewrites CHECK, indexes, views and triggers."""
+        for old_name, new_name in renames:
+            self.connection.execute(
+                f"ALTER TABLE main.{quote_name(table)} RENAME COLUMN {quote_name(old_name)} TO {quote_name(new_name)}"
+            )
 
     def save(self, table: TableDefinition) -> None:
         self.connection.execute(create_table_sql(table))
@@ -279,13 +309,19 @@ class SQLiteTableRepository:
             return
         old_columns = [quote_name(old_name) for old_name, _ in copy_map]
         new_columns = [quote_name(new_name) for _, new_name in copy_map]
-        names = {fold_name(column.name) for column in old.columns + new.columns}
-        old_alias = any(is_rowid_alias(column) for column in old.columns)
-        new_alias = any(is_rowid_alias(column) for column in new.columns)
-        # Row ids are part of the data when no INTEGER PRIMARY KEY holds them.
-        if not (old_alias or new_alias or names & _ROWID_NAMES):
-            old_columns.insert(0, "rowid")
-            new_columns.insert(0, "rowid")
+        # Row ids are data too. An INTEGER PRIMARY KEY of the new table gets them from its column;
+        # otherwise they are copied under a name that no column hides (rowid, oid or _rowid_).
+        if not any(is_rowid_alias(column) for column in new.columns):
+            source = _free_rowid_name(old.columns)
+            target = _free_rowid_name(new.columns)
+            if source is not None and target is not None:
+                old_columns.insert(0, source)
+                new_columns.insert(0, target)
+            elif self.has_rows(final):
+                raise TableOperationError(
+                    "The table has columns named rowid, oid and _rowid_, so its internal row ids "
+                    "cannot be preserved. Rename one of these columns first."
+                )
         self.connection.execute(
             f"INSERT INTO main.{quote_name(temp)} ({', '.join(new_columns)}) "
             f"SELECT {', '.join(old_columns)} FROM main.{quote_name(final)}"
