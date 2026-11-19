@@ -4,8 +4,8 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QTabWidget,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..controller import ConnectionController
@@ -14,6 +14,7 @@ from .models import Index, IndexColumn, SchemaSnapshot, TableInfo
 from .repositories import SQLiteIndexRepository
 from .services import SchemaManager
 from .sql import create_index_sql
+from .table_ui import TablesTab
 
 
 class IndexDialog(QDialog):
@@ -242,11 +243,21 @@ class SchemaTab(QWidget):
         self.message_label = QLabel()
         self.message_label.setObjectName("schema_message")
         self.message_label.setWordWrap(True)
-        layout = QVBoxLayout(self)
+        # Tables and Indexes are separate sections of the Schema tab.
+        self.indexes_page = QWidget()
+        layout = QVBoxLayout(self.indexes_page)
         layout.addWidget(self.active_label)
         layout.addLayout(buttons)
         layout.addWidget(split, 1)
         layout.addWidget(self.message_label)
+        self.tables_tab = TablesTab(controller)
+        self.tables_tab.schema_changed.connect(self._tables_changed)
+        self.sections = QTabWidget()
+        self.sections.addTab(self.tables_tab, "Tables")
+        self.sections.addTab(self.indexes_page, "Indexes")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.sections)
 
         controller.connection_changed.connect(self._connection_changed)
         controller.busy_changed.connect(self._set_busy)
@@ -338,8 +349,12 @@ class SchemaTab(QWidget):
         else:
             self.message_label.setText("No indexes in this database.")
 
+    def _tables_changed(self):
+        # Dropping or rebuilding a table changes its indexes and the table choices of the index form.
+        self._needs_refresh = self.controller.active is not None
+
     def _operation_failed(self, name: str, message: str):
-        if not name.startswith("schema."):
+        if not name.startswith("schema.") or name.startswith("schema.table."):
             return
         self.message_label.setText(message)
         if name in {"schema.delete", "schema.edit"}:

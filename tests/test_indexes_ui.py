@@ -38,6 +38,8 @@ def window(qtbot, tmp_path, monkeypatch):
     qtbot.addWidget(widget)
     widget.show()
     widget.tab_widget.setCurrentWidget(widget.schema_tab)
+    # The Schema tab has Tables and Indexes sections; these tests work with the indexes.
+    widget.schema_tab.sections.setCurrentWidget(widget.schema_tab.indexes_page)
     with qtbot.waitSignal(controller.operation_finished, timeout=5000):
         controller.refresh()
     yield widget
