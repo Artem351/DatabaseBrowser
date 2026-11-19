@@ -481,7 +481,9 @@ class TableDialog(QDialog):
                 original_name=original,
             ))
         name = self._table.name if self._table is not None else self.name_edit.text().strip()
-        return TableDefinition(name, tuple(columns), tuple(self._constraints))
+        # The stored statement the form started from lets the worker detect a changed table.
+        base = self._table.sql if self._table is not None else None
+        return TableDefinition(name, tuple(columns), tuple(self._constraints), sql=base)
 
     def _update_preview(self, *_):
         definition = self.get_definition()

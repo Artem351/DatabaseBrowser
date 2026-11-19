@@ -34,6 +34,8 @@ class ITableRepository(Protocol):
 
     def broken_views(self) -> dict[str, str]: ...
 
+    def triggers(self) -> list[tuple[str, str, str]]: ...
+
     def rename_columns(self, table: str, renames: tuple[tuple[str, str], ...]) -> None: ...
 
     def save(self, table: TableDefinition) -> None: ...
@@ -189,6 +191,13 @@ class SQLiteTableRepository:
             except sqlite3.Error as error:
                 broken[name] = str(error)
         return broken
+
+    def triggers(self) -> list[tuple[str, str, str]]:
+        """Every trigger as (name, table it is attached to, CREATE TRIGGER text)."""
+        rows = self.connection.execute(
+            "SELECT name, tbl_name, sql FROM main.sqlite_schema WHERE type = 'trigger' AND sql IS NOT NULL ORDER BY name"
+        ).fetchall()
+        return [tuple(row) for row in rows]
 
     # ----- writing -----
 

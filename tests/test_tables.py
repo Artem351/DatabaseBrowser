@@ -695,6 +695,109 @@ def test_uc04_views_that_were_already_broken_do_not_block_other_changes(table_db
     assert [c.name for c in get(manager, "audit").columns] == ["msg", "extra"]
 
 
+def test_uc04_stale_form_is_rejected_and_the_new_column_is_kept(table_db):
+    path, connection, manager = table_db
+    books = editing(get(manager, "books"))  # the form is opened here
+    other = sqlite3.connect(path)
+    other.execute("ALTER TABLE books ADD COLUMN isbn TEXT")
+    other.execute("UPDATE books SET isbn = '111' WHERE id = 1")
+    other.commit()
+    other.close()
+    before = schema_state(connection)
+    with pytest.raises(TableOperationError, match="changed after this form was opened"):
+        manager.alter_table(replace(books, columns=books.columns + (ColumnDef("lang", "TEXT"),)))
+    assert schema_state(connection) == before
+    assert connection.execute("SELECT isbn FROM books WHERE id = 1").fetchone() == ("111",)
+    assert not connection.in_transaction
+    # Opening the form again shows the new column; saving that form keeps its data.
+    fresh = editing(get(manager, "books"))
+    assert "isbn" in [column.name for column in fresh.columns]
+    manager.alter_table(replace(fresh, columns=fresh.columns + (ColumnDef("lang", "TEXT"),)))
+    assert connection.execute("SELECT isbn, lang FROM books WHERE id = 1").fetchone() == ("111", None)
+
+
+@pytest.mark.parametrize("change", [
+    "ALTER TABLE notes ADD COLUMN extra TEXT",
+    "ALTER TABLE notes RENAME COLUMN body TO text",
+])
+def test_uc04_any_change_of_the_stored_table_makes_the_form_stale(table_db, change):
+    path, connection, manager = table_db
+    notes = editing(get(manager, "notes"))
+    other = sqlite3.connect(path)
+    other.execute(change)
+    other.commit()
+    other.close()
+    with pytest.raises(TableOperationError, match="changed after this form was opened"):
+        manager.alter_table(notes)
+
+
+def test_uc04_data_changes_do_not_make_the_form_stale(table_db):
+    path, connection, manager = table_db
+    notes = editing(get(manager, "notes"))
+    other = sqlite3.connect(path)
+    other.execute("INSERT INTO notes(body, tag) VALUES ('new', 'n')")
+    other.commit()
+    other.close()
+    manager.alter_table(replace(notes, columns=notes.columns + (ColumnDef("extra", "TEXT"),)))
+    assert connection.execute("SELECT count(*) FROM notes").fetchone() == (3,)
+
+
+def test_uc04_form_without_a_base_version_is_rejected(table_db):
+    _, connection, manager = table_db
+    notes = replace(editing(get(manager, "notes")), sql=None)
+    before = schema_state(connection)
+    with pytest.raises(TableOperationError, match="does not say which version"):
+        manager.alter_table(notes)
+    assert schema_state(connection) == before
+
+
+@pytest.mark.parametrize("trigger", [
+    "CREATE TRIGGER tr_posts AFTER INSERT ON posts BEGIN INSERT INTO audit(msg) VALUES (NEW.title); END",
+    'CREATE TRIGGER tr_posts AFTER INSERT ON posts BEGIN INSERT INTO audit(msg) VALUES (NEW."title"); END',
+    "CREATE TRIGGER tr_posts AFTER UPDATE OF title ON posts BEGIN SELECT 1; END",
+    "CREATE TRIGGER tr_posts AFTER INSERT ON audit BEGIN UPDATE posts SET body = NEW.msg WHERE title = 'x'; END",
+])
+def test_uc04_removing_a_column_used_by_a_trigger_is_refused(table_db, trigger):
+    _, connection, manager = table_db
+    connection.execute("CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+    connection.execute(trigger)
+    connection.commit()
+    posts = editing(get(manager, "posts"))
+    before = schema_state(connection)
+    with pytest.raises(TableOperationError, match='Trigger "tr_posts" may use column "title"'):
+        manager.alter_table(replace(posts, columns=tuple(c for c in posts.columns if c.name != "title")))
+    assert schema_state(connection) == before
+    assert not connection.in_transaction
+    # Nothing was changed, so the trigger still works.
+    connection.execute("INSERT INTO posts(title) VALUES ('t')")
+    connection.execute("INSERT INTO audit(msg) VALUES ('m')")
+    connection.rollback()
+
+
+def test_uc04_columns_the_triggers_do_not_use_can_still_be_removed(table_db):
+    _, connection, manager = table_db
+    connection.execute("CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+    connection.execute("CREATE TRIGGER tr_posts AFTER INSERT ON posts BEGIN INSERT INTO audit(msg) VALUES (NEW.title); END")
+    connection.commit()
+    posts = editing(get(manager, "posts"))
+    manager.alter_table(replace(posts, columns=tuple(c for c in posts.columns if c.name != "body")))
+    connection.execute("INSERT INTO posts(title) VALUES ('t')")
+    assert ("t",) in connection.execute("SELECT msg FROM audit").fetchall()
+    connection.rollback()
+
+
+def test_uc04_text_in_string_literals_is_not_a_column_reference(table_db):
+    _, connection, manager = table_db
+    connection.execute("CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT)")
+    connection.execute("CREATE TRIGGER tr_posts AFTER INSERT ON posts BEGIN INSERT INTO audit(msg) VALUES ('title'); END")
+    connection.commit()
+    posts = editing(get(manager, "posts"))
+    manager.alter_table(replace(posts, columns=tuple(c for c in posts.columns if c.name != "title")))
+    connection.execute("INSERT INTO posts DEFAULT VALUES")
+    assert ("title",) in connection.execute("SELECT msg FROM audit").fetchall()
+    connection.rollback()
+
+
 def test_uc04_foreign_key_needing_missing_parents_is_rejected(table_db):
     _, connection, manager = table_db
     connection.execute("CREATE TABLE loose(id INTEGER PRIMARY KEY, author_id INTEGER)")

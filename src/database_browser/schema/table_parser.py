@@ -58,6 +58,11 @@ def _tokens(sql: str) -> list[_Token]:
     return [_Token(m.lastgroup, m.group(), m.start(), m.end()) for m in _TOKEN.finditer(sql)]
 
 
+def identifiers(sql: str) -> set[str]:
+    """Names used in a statement: bare words and quoted identifiers, but no string literals or comments."""
+    return {unquote(token.text) for token in _tokens(sql) if token.kind in {"word", "quoted"}}
+
+
 def has_comment(sql: str) -> bool:
     return any(token.kind == "comment" for token in _tokens(sql))
 

@@ -470,6 +470,49 @@ def test_uc04_rename_keeps_check_and_view_working(qtbot, window, table_database)
             connection.execute("INSERT INTO scores VALUES (2, -1)")
 
 
+def test_uc04_stale_form_is_rejected_and_the_external_column_survives(qtbot, window, table_database):
+    open_database(qtbot, window, table_database)
+    tab = window.schema_tab.tables_tab
+    dialog = open_edit_dialog(qtbot, tab, "authors")
+    with closing(sqlite3.connect(table_database)) as connection, connection:
+        connection.execute("ALTER TABLE authors ADD COLUMN country TEXT")
+        connection.execute("UPDATE authors SET country = 'FI'")
+    dialog.add_column(ColumnDef("note", "TEXT"))
+    assert not save_dialog(qtbot, window, dialog, ALTER)
+    assert tab.table_dialog is dialog and dialog.isVisible()
+    assert "changed after this form was opened" in dialog.validation_label.text()
+    with closing(sqlite3.connect(table_database)) as connection:
+        assert [row[1] for row in connection.execute("PRAGMA table_info(authors)")] == ["id", "name", "country"]
+        assert connection.execute("SELECT country FROM authors ORDER BY id").fetchall() == [("FI",), ("FI",)]
+    # The list refreshes, so a reopened form shows the external column.
+    qtbot.waitUntil(lambda: not window.controller.busy, timeout=5000)
+    assert "country" in [c.name for c in tab.selected_table().columns]
+    qtbot.mouseClick(dialog.buttons.button(QDialogButtonBox.StandardButton.Cancel), Qt.MouseButton.LeftButton)
+    dialog = open_edit_dialog(qtbot, tab, "authors")
+    dialog.add_column(ColumnDef("note", "TEXT"))
+    assert save_dialog(qtbot, window, dialog, ALTER)
+    with closing(sqlite3.connect(table_database)) as connection:
+        assert connection.execute("SELECT country, note FROM authors ORDER BY id").fetchall() == [("FI", None), ("FI", None)]
+
+
+def test_uc04_removing_a_column_used_by_a_trigger_is_refused(qtbot, window, table_database):
+    with closing(sqlite3.connect(table_database)) as connection, connection:
+        connection.execute("CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+        connection.execute("CREATE TABLE log(msg TEXT)")
+        connection.execute("CREATE TRIGGER tr_posts AFTER INSERT ON posts BEGIN INSERT INTO log VALUES (NEW.title); END")
+    open_database(qtbot, window, table_database)
+    tab = window.schema_tab.tables_tab
+    dialog = open_edit_dialog(qtbot, tab, "posts")
+    dialog.columns_table.setCurrentCell(1, COL_NAME)
+    dialog.remove_selected_column()
+    assert [c.name for c in dialog.get_definition().columns] == ["id", "body"]
+    assert not save_dialog(qtbot, window, dialog, ALTER)
+    assert tab.table_dialog is dialog and 'Trigger "tr_posts"' in dialog.validation_label.text()
+    with closing(sqlite3.connect(table_database)) as connection:
+        assert [row[1] for row in connection.execute("PRAGMA table_info(posts)")] == ["id", "title", "body"]
+        connection.execute("INSERT INTO posts(title) VALUES ('still works')")
+
+
 # ---------------------------------------------------------------- UC-05
 
 

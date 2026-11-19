@@ -9,6 +9,7 @@ from .errors import TableOperationError
 from .table_models import (
     CHECK, FOREIGN_KEY, PRIMARY_KEY, UNIQUE, TableConstraint, TableDefinition, TableSnapshot,
 )
+from .table_parser import identifiers
 from .table_repository import ITableRepository
 from .table_sql import (
     check_expression, check_type, create_table_sql, declared_keys, fold_name, is_rowid_alias,
@@ -183,6 +184,7 @@ class TableManager:
                 old = next((t for t in tables if fold_name(t.name) == fold_name(definition.name)), None)
                 if old is None:
                     raise TableOperationError(f'Table "{definition.name}" does not exist. Refresh the schema.')
+                self._check_not_stale(old, definition)
                 if not old.editable:
                     raise TableOperationError(old.reason or "This table cannot be edited with this form.")
                 new = replace(_normalized(definition), name=old.name)
@@ -195,6 +197,7 @@ class TableManager:
                 self._check_rename_targets(old, new, renames)
                 self._check_children(old, new, others)
                 self._check_data(old, new, copy_map)
+                self._check_triggers(old, copy_map)
                 broken_before = self.repository.broken_views()
                 if renames:
                     # SQLite rewrites CHECK constraints, indexes, views and triggers that use the column.
@@ -225,6 +228,38 @@ class TableManager:
             used.add(key)
             pairs.append((stored[key], column.name))
         return tuple(pairs)
+
+    @staticmethod
+    def _check_not_stale(old: TableDefinition, definition: TableDefinition) -> None:
+        """The form edits the table as it was when the form opened; refuse if that is no longer true."""
+        if definition.sql is None:
+            raise TableOperationError(
+                "The form does not say which version of the table it edits. Close it and open it again."
+            )
+        if definition.sql != old.sql:
+            raise TableOperationError(
+                f'Table "{old.name}" was changed after this form was opened, for example by another '
+                "connection. Close the form and open it again so those changes are not lost."
+            )
+
+    def _check_triggers(self, old: TableDefinition, copy_map: tuple[tuple[str, str], ...]) -> None:
+        """SQLite keeps no dependencies for triggers, so read their text for removed columns."""
+        kept = {fold_name(old_name) for old_name, _ in copy_map}
+        removed = [column.name for column in old.columns if fold_name(column.name) not in kept]
+        if not removed:
+            return
+        table = fold_name(old.name)
+        for name, owner, sql in self.repository.triggers():
+            words = {fold_name(word) for word in identifiers(sql)}
+            # A trigger on another table matters only when its text mentions this table.
+            if fold_name(owner) != table and table not in words:
+                continue
+            for column in removed:
+                if fold_name(column) in words:
+                    raise TableOperationError(
+                        f'Trigger "{name}" may use column "{column}", which this change removes. '
+                        "Change or delete the trigger first."
+                    )
 
     @staticmethod
     def _renames(old: TableDefinition, new: TableDefinition) -> tuple[tuple[str, str], ...]:
