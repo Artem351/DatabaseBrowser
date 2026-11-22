@@ -194,8 +194,8 @@ class DatabaseTab(QWidget):
         NotificationManager.show_error(self, message)
 
     def _operation_error(self, name: str, message: str):
-        # Schema errors belong to their own tab and should only be shown once.
-        if not name.startswith("schema."):
+        # Schema and SQL errors belong to their own tabs
+        if not name.startswith(("schema.", "query.")):
             self._show_error(message)
 
     def _operation_finished(self, name: str, success: bool):
@@ -265,12 +265,20 @@ class MainWindow(QMainWindow):
 
         self.schema_tab = SchemaTab(controller)
         self.tab_widget.addTab(self.schema_tab, "Schema")
-        # The team will add the other use cases as separate modules.
-        for name in ["SQL Editor", "Query Plan"]:
-            index = self.tab_widget.addTab(QWidget(), name)
-            self.tab_widget.setTabEnabled(index, False)
+        from .queries.ui import SqlEditorTab
+
+        self.sql_tab = SqlEditorTab(controller)
+        self.sql_tab.schema_changed.connect(self._sql_schema_changed)
+        self.tab_widget.addTab(self.sql_tab, "SQL Editor")
+        index = self.tab_widget.addTab(QWidget(), "Query Plan")
+        self.tab_widget.setTabEnabled(index, False)
         self.setCentralWidget(self.tab_widget)
         controller.shutdown_complete.connect(self._finish_close)
+
+    def _sql_schema_changed(self):
+        # Both sections refresh through the shared queue after the SQL operation finishes
+        self.schema_tab._needs_refresh = True
+        self.schema_tab.tables_tab._needs_refresh = True
 
     def closeEvent(self, event):
         """Delay closing the window until the connection is released."""
@@ -279,9 +287,11 @@ class MainWindow(QMainWindow):
         else:
             # Wait for the worker before closing the window so the connection is released.
             event.ignore()
+            self.sql_tab.cancel_pending()
             self.controller.request_shutdown()
 
     def _finish_close(self):
         """Close the window after the worker shutdown signal."""
         self._ready_to_close = True
+        self.sql_tab.close_cache()
         self.close()

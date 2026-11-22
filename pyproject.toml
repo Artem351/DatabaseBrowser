@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "database-browser-connections"
 version = "0.1.1"
-description = "Database Browser: SQLite connections and index management"
+description = "Database Browser: SQLite connections, schema management and SQL queries"
 requires-python = ">=3.11"
 dependencies = ["PyQt6>=6.7,<7"]
 classifiers = [
