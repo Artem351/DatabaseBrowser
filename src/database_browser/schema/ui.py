@@ -15,6 +15,7 @@ from .repositories import SQLiteIndexRepository
 from .services import SchemaManager
 from .sql import create_index_sql
 from .table_ui import TablesTab
+from .view_ui import ViewsTab
 
 
 class IndexDialog(QDialog):
@@ -252,8 +253,10 @@ class SchemaTab(QWidget):
         layout.addWidget(self.message_label)
         self.tables_tab = TablesTab(controller)
         self.tables_tab.schema_changed.connect(self._tables_changed)
+        self.views_tab = ViewsTab(controller)
         self.sections = QTabWidget()
         self.sections.addTab(self.tables_tab, "Tables")
+        self.sections.addTab(self.views_tab, "Views")
         self.sections.addTab(self.indexes_page, "Indexes")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -352,9 +355,11 @@ class SchemaTab(QWidget):
     def _tables_changed(self):
         # Dropping or rebuilding a table changes its indexes and the table choices of the index form.
         self._needs_refresh = self.controller.active is not None
+        # Views may read the changed table, so their definitions and health are read again too.
+        self.views_tab.schema_outdated()
 
     def _operation_failed(self, name: str, message: str):
-        if not name.startswith("schema.") or name.startswith("schema.table."):
+        if not name.startswith("schema.") or name.startswith(("schema.table.", "schema.view.")):
             return
         self.message_label.setText(message)
         if name in {"schema.delete", "schema.edit"}:
