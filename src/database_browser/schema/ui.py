@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
 
 from ..controller import ConnectionController
 from ..errors import DatabaseBrowserError
+from .export_ui import OP_EXPORT, ExportTab
 from .models import Index, IndexColumn, SchemaSnapshot, TableInfo
 from .repositories import SQLiteIndexRepository
 from .services import SchemaManager
@@ -244,7 +245,6 @@ class SchemaTab(QWidget):
         self.message_label = QLabel()
         self.message_label.setObjectName("schema_message")
         self.message_label.setWordWrap(True)
-        # Tables and Indexes are separate sections of the Schema tab.
         self.indexes_page = QWidget()
         layout = QVBoxLayout(self.indexes_page)
         layout.addWidget(self.active_label)
@@ -258,6 +258,8 @@ class SchemaTab(QWidget):
         self.sections.addTab(self.tables_tab, "Tables")
         self.sections.addTab(self.views_tab, "Views")
         self.sections.addTab(self.indexes_page, "Indexes")
+        self.export_tab = ExportTab(controller)
+        self.sections.addTab(self.export_tab, "Export")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self.sections)
@@ -360,6 +362,8 @@ class SchemaTab(QWidget):
 
     def _operation_failed(self, name: str, message: str):
         if not name.startswith("schema.") or name.startswith(("schema.table.", "schema.view.")):
+            return
+        if name == OP_EXPORT:
             return
         self.message_label.setText(message)
         if name in {"schema.delete", "schema.edit"}:
