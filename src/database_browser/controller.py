@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
 
 from .background import BackgroundTaskManager
 from .errors import DatabaseBrowserError
@@ -51,7 +51,8 @@ class ConnectionController(QObject):
         # A shutdown request and a completed shutdown are separate states.
         self._closing = False
         self._closed = False
-        self._completed.connect(self._on_completed)
+        # A Future may finish before its callback is attached, even in the UI thread
+        self._completed.connect(self._on_completed, Qt.ConnectionType.QueuedConnection)
 
     def _get_manager(self) -> ConnectionManager:
         """Create the manager in the worker when the first task starts."""
@@ -77,15 +78,17 @@ class ConnectionController(QObject):
                 # Do not try to reopen corrupt profile storage during shutdown.
                 manager = self._manager if name == "shutdown" else self._get_manager()
                 if manager is not None:
+                    if name.startswith("schema.") and not name.endswith("refresh"):
+                        manager.executor.close_result()
                     result = operation(manager)
             except DatabaseBrowserError as exception:
                 error = str(exception)
             except Exception as exception:
                 logging.getLogger(__name__).exception("Database operation failed")
                 error = f"Unexpected error: {exception}"
-            if manager is not None and name != "shutdown" and not name.startswith("schema."):
-                # Schema operations cannot change profiles. An unrelated settings error
-                # must not hide a successfully saved index from the interface.
+            if manager is not None and name != "shutdown" and not name.startswith(("schema.", "query.")):
+                # Schema and query operations cannot change saved profiles
+                # An unrelated settings error must not hide their results
                 # For example, the connection may have closed even if deleting the profile failed.
                 try:
                     profiles = manager.list_connections()

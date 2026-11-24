@@ -26,6 +26,7 @@ class QueryExecutor:
         self._owner_thread: int | None = None
         self.file_path: str | None = None
         self.read_only = False
+        self._result_set = None
 
     def _check_thread(self):
         """Remember the first calling thread and check later calls."""
@@ -110,6 +111,7 @@ class QueryExecutor:
             if self._connection.in_transaction:
                 # An automatic rollback here could silently discard changes.
                 raise DatabaseConnectionError("Finish or roll back the active transaction before disconnecting.")
+            self.close_result()
             try:
                 self._connection.close()
             except sqlite3.Error as error:
@@ -117,4 +119,33 @@ class QueryExecutor:
         self._connection = None
         self.file_path = None
         self.read_only = False
+
+    def execute(self, sql: str, *, chunk_size: int = 500, cancellation=None):
+        """Execute one statement and keep its result in the owning worker"""
+        from .queries.errors import QueryError
+        from .queries.result_set import ResultSet
+        from .queries.sql import statement_body
+
+        connection = self.connection
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or not 1 <= chunk_size <= 5000:
+            raise QueryError('Batch size must be between 1 and 5000')
+        statement_body(sql)
+        self.close_result()
+        self._result_set = ResultSet(connection, sql, chunk_size, cancellation)
+        return self._result_set
+
+    def get_result(self, result_id: str):
+        """Refuse requests from a replaced result or a previous connection"""
+        from .queries.errors import QueryError
+
+        self._check_thread()
+        if self._result_set is None or self._result_set.result_id != result_id:
+            raise QueryError('This result is no longer active; run the query again')
+        return self._result_set
+
+    def close_result(self):
+        self._check_thread()
+        if self._result_set is not None:
+            self._result_set.close()
+            self._result_set = None
 
